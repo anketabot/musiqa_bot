@@ -70,8 +70,7 @@ COOKIE_FILE = os.path.join(os.getcwd(), "cookies.txt")
 
 def get_cookiefile() -> str | None:
     """Agar cookies.txt mavjud bo'lsa, yo'lini qaytaradi, aks holda None.
-    YouTube cookies eskirgan yoki Premium bo'lsa, ularni ishlatmaydi.
-    GitHub issue #15330: Premium cookies format tanlashni buzadi."""
+    YouTube cookies eskirgan yoki noto'g'ri bo'lsa, ularni ishlatmaydi."""
     if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 100:
         try:
             with open(COOKIE_FILE, 'r', encoding='utf-8') as f:
@@ -81,22 +80,18 @@ def get_cookiefile() -> str | None:
             has_youtube = '.youtube.com' in cookie_content
             has_login = 'LOGIN_INFO' in cookie_content or 'SID' in cookie_content
 
-            if not has_youtube or not has_login:
-                return COOKIE_FILE  # YouTube cookies yo'q, muammo emas
+            if not has_youtube:
+                return None  # YouTube cookies yo'q
 
-            # MUHIM: Premium subscription cookiesni tekshirish
-            # GitHub issue #15330: Premium cookies format tanlashni buzadi
-            # Premium cookies: "LOGIN_INFO" va "__Secure-1PSIDTS" birga bo'lsa
-            has_premium_indicators = (
-                'LOGIN_INFO' in cookie_content and 
-                ('__Secure-1PSIDTS' in cookie_content or '__Secure-3PSIDTS' in cookie_content)
-            )
+            if not has_login:
+                return None  # Login cookies yo'q, anonim
 
-            if has_premium_indicators:
-                logging.warning("[COOKIES] YouTube Premium cookies aniqlandi. Format muammolarni oldini olish uchun cookies O'CHIRILDI.")
-                return None  # Premium cookiesni ishlatma!
+            # ESKI LOGICNI O'CHIRAMIZ: __Secure-1PSIDTS har qanday Google account'da bo'ladi
+            # Bu Premium emas, shuning uchun cookiesni o'chirmaymiz
+            # Faqat LOGIN_INFO va SID cookie'lari yetarli
 
             return COOKIE_FILE
+
         except Exception:
             return COOKIE_FILE
     return None
@@ -126,6 +121,58 @@ def build_query_from_filename(filename: str) -> str | None:
 
 
 # ========================== HELPERS ==========================
+
+
+# ========================== FILE VALIDATION ==========================
+def is_valid_image(path: str) -> bool:
+    """Fayl haqiqiy rasm ekanligini tekshirish (magic bytes orqali)"""
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(12)
+        # JPEG
+        if header.startswith(b'\xff\xd8\xff'):
+            return True
+        # PNG
+        if header.startswith(b'\x89PNG\r\n\x1a\n'):
+            return True
+        # WEBP
+        if header.startswith(b'RIFF') and b'WEBP' in header[:12]:
+            return True
+        # GIF
+        if header.startswith(b'GIF87a') or header.startswith(b'GIF89a'):
+            return True
+        # BMP
+        if header.startswith(b'BM'):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def is_valid_video(path: str) -> bool:
+    """Fayl haqiqiy video ekanligini tekshirish (magic bytes orqali)"""
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(12)
+        # MP4 / MOV (ftyp/moov)
+        if b'ftyp' in header[4:12] or b'moov' in header[4:8]:
+            return True
+        # WEBM / MKV (EBML)
+        if header.startswith(b'\x1a\x45\xdf\xa3'):
+            return True
+        # AVI
+        if header.startswith(b'RIFF') and b'AVI' in header[8:12]:
+            return True
+        # FLV
+        if header.startswith(b'FLV'):
+            return True
+        # MPEG
+        if header.startswith(b'\x00\x00\x01\xba') or header.startswith(b'\x00\x00\x01\xb3'):
+            return True
+        return False
+    except Exception:
+        return False
+
 def build_share_kb() -> InlineKeyboardMarkup:
     """Faqat guruhga qo'shish knopkasi (rasm uchun)"""
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1892,6 +1939,111 @@ link_download_state: dict[int, dict[str, Any]] = {}
 
 db: Database | None = None
 
+
+# ========================== INSTAGRAM CAROUSEL ==========================
+async def download_instagram_all_media(url: str) -> list[tuple[str, dict[str, Any]]]:
+    """
+    Instagram post/carousel dan BARCHA rasmlar va videolarni yuklash.
+    Carousel postlar uchun barcha media fayllarni qaytaradi.
+    """
+    def _download():
+        cookie_path = get_cookiefile()
+        # Har bir fayl uchun alohida nom (carousel uchun)
+        output_template = os.path.join(
+            tempfile.gettempdir(), 
+            f"ig_car_{datetime.now().timestamp():.0f}_%(playlist_index)s_%(ext)s"
+        )
+
+        ydl_opts = {
+            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
+            'outtmpl': output_template,
+            'quiet': True,
+            'no_warnings': True,
+            'ignoreerrors': True,
+            'socket_timeout': 60,
+            'retries': 10,
+            'fragment_retries': 10,
+            'file_access_retries': 5,
+            'nocheckcertificate': True,
+            'headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://www.instagram.com/',
+            },
+        }
+
+        if cookie_path:
+            ydl_opts['cookiefile'] = cookie_path
+
+        downloaded_files = []
+
+        def extract_metadata(entry, info):
+            title = None
+            if isinstance(entry, dict):
+                title = entry.get('title')
+            if not title and isinstance(info, dict):
+                title = info.get('title')
+            metadata = {"title": title} if title else {}
+            return metadata
+
+        # Avval cookies SIZ urinib ko'ramiz, keyin cookies BILAN
+        for use_cookies in [False, True]:
+            opts = dict(ydl_opts)
+            if not use_cookies and cookie_path:
+                opts.pop('cookiefile', None)
+            elif use_cookies and cookie_path:
+                opts['cookiefile'] = cookie_path
+
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if not info:
+                        continue
+
+                    entries = info.get('entries', [info])
+                    for entry in entries:
+                        if not entry:
+                            continue
+
+                        downloaded_path = ydl.prepare_filename(entry)
+                        metadata = extract_metadata(entry, info)
+
+                        # Asosiy fayl
+                        if os.path.exists(downloaded_path) and os.path.getsize(downloaded_path) > 1024:
+                            downloaded_files.append((downloaded_path, metadata))
+                            continue
+
+                        # Boshqa kengaytmalar bilan qidirish
+                        base = downloaded_path.rsplit(".", 1)[0] if "." in downloaded_path else downloaded_path
+                        found = False
+                        for ext in ['.mp4', '.webm', '.mkv', '.mov', '.m4v', '.jpg', '.jpeg', '.png', '.webp']:
+                            candidate = base + ext
+                            if os.path.exists(candidate) and os.path.getsize(candidate) > 1024:
+                                downloaded_files.append((candidate, metadata))
+                                found = True
+                                break
+
+                        if not found:
+                            # Temp papkada umumiy prefix bo'yicha qidirish
+                            temp_dir = tempfile.gettempdir()
+                            prefix = os.path.basename(base)
+                            for f in os.listdir(temp_dir):
+                                if f.startswith(prefix) and os.path.getsize(os.path.join(temp_dir, f)) > 1024:
+                                    downloaded_files.append((os.path.join(temp_dir, f), metadata))
+                                    break
+
+                if downloaded_files:
+                    return downloaded_files
+
+            except Exception as e:
+                logging.warning(f"Instagram carousel yuklashda xatolik (cookies={'ha' if use_cookies else 'yo\'q'}): {e}")
+                continue
+
+        return downloaded_files
+
+    return await asyncio.to_thread(_download)
+
 # ========================== KEYBOARDS ==========================
 def lang_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -3125,101 +3277,163 @@ async def text_handler(message: Message):
         try:
             # URL'ni normalize qilish
             url_text = message.text.strip()
-            
+
             # Threads: threads.com -> threads.net
             if re.search(r'https?://(?:www\.)?threads\.com/', url_text, flags=re.I):
                 url_text = re.sub(r'^(https?://)(?:www\.)?threads\.com/', r"\1www.threads.net/", url_text, flags=re.I)
-            
+
             # MUHIM: Qisqa URL'larni to'liq URL'ga o'zgartirish
             url_text = await resolve_short_url(url_text)
 
-            downloaded_path, downloaded_meta = await download_video(url_text)
-            if not downloaded_path or not os.path.exists(downloaded_path):
-                # Instagram uchun fallback usullar
-                if "instagram" in message.text.lower():
-                    logging.info(f"[Instagram] Fallback boshlanmoqda: {message.text}")
+            # ===== INSTAGRAM MAXSUS ISHLASH (Carousel + barcha rasmlar) =====
+            if "instagram" in url_text.lower():
+                # 1. Avval carousel yuklash (barcha rasmlar/videolar)
+                ig_media_list = await download_instagram_all_media(url_text)
+                if ig_media_list:
+                    sent_count = 0
+                    for ig_path, ig_meta in ig_media_list:
+                        if not os.path.exists(ig_path) or os.path.getsize(ig_path) < 1024:
+                            _cleanup_file(ig_path)
+                            continue
 
-                    # 1. ENG ISHONCHLI: download_instagram_direct (API + Embed + Page)
-                    direct_path, direct_meta = await download_instagram_direct(message.text)
-                    if direct_path and os.path.exists(direct_path):
-                        file_size_mb = os.path.getsize(direct_path) / (1024 * 1024)
-                        ext = direct_path.split(".")[-1].lower()
+                        file_size_mb = os.path.getsize(ig_path) / (1024 * 1024)
+                        ext = ig_path.split(".")[-1].lower() if "." in ig_path else ""
 
-                        if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'):
-                            # Rasm
-                            if file_size_mb <= 10:
+                        # Fayl turini aniqlash (magic bytes + ext)
+                        is_image = is_valid_image(ig_path) or ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp')
+                        is_video = is_valid_video(ig_path) or ext in ('mp4', 'webm', 'mov', 'mkv', 'avi', 'm4v')
+
+                        try:
+                            if is_image and file_size_mb <= 10:
                                 await message.answer_photo(
-                                    photo=FSInputFile(direct_path),
-                                    caption=SHARE_PROMO_CAPTION,
-                                    reply_markup=build_share_kb(),
+                                    photo=FSInputFile(ig_path),
+                                    caption=SHARE_PROMO_CAPTION if sent_count == 0 else None,
+                                    reply_markup=build_share_kb() if sent_count == 0 else None,
                                 )
-                            else:
-                                await message.answer(SHARE_PROMO_CAPTION, reply_markup=build_share_kb())
-                            _cleanup_file(direct_path)
-                            return
-                        else:
-                            # Video
-                            link_download_state[message.from_user.id] = {
-                                "path": direct_path,
-                                "title": direct_meta.get("title") if direct_meta else None,
-                            }
-                            kb = build_video_kb(message.from_user.id, lang)
-                            if file_size_mb <= 50:
+                                sent_count += 1
+                            elif is_video and file_size_mb <= 50:
+                                kb = build_video_kb(message.from_user.id, lang) if sent_count == 0 else None
                                 await message.answer_video(
-                                    video=FSInputFile(direct_path),
-                                    caption=SHARE_PROMO_CAPTION,
+                                    video=FSInputFile(ig_path),
+                                    caption=SHARE_PROMO_CAPTION if sent_count == 0 else None,
                                     reply_markup=kb,
                                 )
+                                sent_count += 1
                             else:
-                                await message.answer(SHARE_PROMO_CAPTION, reply_markup=kb)
-                            return
+                                # Katta yoki noma'lum format -> document sifatida
+                                await message.answer_document(
+                                    document=FSInputFile(ig_path),
+                                    caption=SHARE_PROMO_CAPTION if sent_count == 0 else None,
+                                    reply_markup=build_share_kb() if sent_count == 0 else None,
+                                )
+                                sent_count += 1
+                        except TelegramAPIError as e:
+                            if "IMAGE_PROCESS_FAILED" in str(e) or "PHOTO_INVALID_DIMENSIONS" in str(e):
+                                logging.warning(f"Rasm yuborish xatosi, document sifatida yuborilmoqda: {e}")
+                                try:
+                                    await message.answer_document(
+                                        document=FSInputFile(ig_path),
+                                        caption=SHARE_PROMO_CAPTION if sent_count == 0 else None,
+                                        reply_markup=build_share_kb() if sent_count == 0 else None,
+                                    )
+                                    sent_count += 1
+                                except Exception as e2:
+                                    logging.error(f"Document sifatida ham yuborilmadi: {e2}")
+                            else:
+                                logging.error(f"Telegram API xatosi: {e}")
+                        finally:
+                            _cleanup_file(ig_path)
 
-                    # 2. Eski embed usuli (agar yangisi ishlamasa)
-                    embed_path = await download_instagram_embed(message.text)
-                    if embed_path and os.path.exists(embed_path):
-                        file_size_mb = os.path.getsize(embed_path) / (1024 * 1024)
-                        ext = embed_path.split(".")[-1].lower()
+                    if sent_count > 0:
+                        return  # Barcha fayllar yuborildi, chiqish
 
-                        if ext in ('jpg', 'jpeg', 'png', 'webp'):
+                # 2. Fallback: Eski usullar (agar carousel ishlamasa)
+                logging.info(f"[Instagram] Carousel yuklash ishlamadi, fallback boshlanmoqda: {url_text}")
+
+                # 2a. ENG ISHONCHLI: download_instagram_direct (API + Embed + Page)
+                direct_path, direct_meta = await download_instagram_direct(url_text)
+                if direct_path and os.path.exists(direct_path):
+                    file_size_mb = os.path.getsize(direct_path) / (1024 * 1024)
+                    ext = direct_path.split(".")[-1].lower()
+
+                    if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'):
+                        # Rasm
+                        if file_size_mb <= 10:
                             await message.answer_photo(
-                                photo=FSInputFile(embed_path),
+                                photo=FSInputFile(direct_path),
                                 caption=SHARE_PROMO_CAPTION,
                                 reply_markup=build_share_kb(),
                             )
-                            _cleanup_file(embed_path)
-                            return
                         else:
-                            link_download_state[message.from_user.id] = {
-                                "path": embed_path,
-                                "title": None,
-                            }
-                            kb = build_video_kb(message.from_user.id, lang)
-                            if file_size_mb <= 50:
-                                await message.answer_video(
-                                    video=FSInputFile(embed_path),
-                                    caption=SHARE_PROMO_CAPTION,
-                                    reply_markup=kb,
-                                )
-                            else:
-                                await message.answer(SHARE_PROMO_CAPTION, reply_markup=kb)
-                            return
-
-                    # 3. API usuli
-                    api_path = await download_instagram_api(message.text)
-                    if api_path and os.path.exists(api_path):
-                        await message.answer_photo(
-                            photo=FSInputFile(api_path),
-                            caption=TEXTS[lang]["photo_from_link"],
-                            reply_markup=build_share_kb(),
-                        )
-                        _cleanup_file(api_path)
+                            await message.answer(SHARE_PROMO_CAPTION, reply_markup=build_share_kb())
+                        _cleanup_file(direct_path)
+                        return
+                    else:
+                        # Video
+                        link_download_state[message.from_user.id] = {
+                            "path": direct_path,
+                            "title": direct_meta.get("title") if direct_meta else None,
+                        }
+                        kb = build_video_kb(message.from_user.id, lang)
+                        if file_size_mb <= 50:
+                            await message.answer_video(
+                                video=FSInputFile(direct_path),
+                                caption=SHARE_PROMO_CAPTION,
+                                reply_markup=kb,
+                            )
+                        else:
+                            await message.answer(SHARE_PROMO_CAPTION, reply_markup=kb)
                         return
 
-                    # Hamma usul ishlamasa
-                    logging.error(f"[Instagram] Barcha usullar ishlamadi: {message.text}")
-                    await message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
+                # 2b. Eski embed usuli
+                embed_path = await download_instagram_embed(url_text)
+                if embed_path and os.path.exists(embed_path):
+                    file_size_mb = os.path.getsize(embed_path) / (1024 * 1024)
+                    ext = embed_path.split(".")[-1].lower()
+
+                    if ext in ('jpg', 'jpeg', 'png', 'webp'):
+                        await message.answer_photo(
+                            photo=FSInputFile(embed_path),
+                            caption=SHARE_PROMO_CAPTION,
+                            reply_markup=build_share_kb(),
+                        )
+                        _cleanup_file(embed_path)
+                        return
+                    else:
+                        link_download_state[message.from_user.id] = {
+                            "path": embed_path,
+                            "title": None,
+                        }
+                        kb = build_video_kb(message.from_user.id, lang)
+                        if file_size_mb <= 50:
+                            await message.answer_video(
+                                video=FSInputFile(embed_path),
+                                caption=SHARE_PROMO_CAPTION,
+                                reply_markup=kb,
+                            )
+                        else:
+                            await message.answer(SHARE_PROMO_CAPTION, reply_markup=kb)
+                        return
+
+                # 2c. API usuli
+                api_path = await download_instagram_api(url_text)
+                if api_path and os.path.exists(api_path):
+                    await message.answer_photo(
+                        photo=FSInputFile(api_path),
+                        caption=TEXTS[lang]["photo_from_link"],
+                        reply_markup=build_share_kb(),
+                    )
+                    _cleanup_file(api_path)
                     return
 
+                # Hamma usul ishlamasa
+                logging.error(f"[Instagram] Barcha usullar ishlamadi: {url_text}")
+                await message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
+                return
+
+            # ===== BOSHQA PLATFORMALAR (YouTube, TikTok, etc.) =====
+            downloaded_path, downloaded_meta = await download_video(url_text)
+            if not downloaded_path or not os.path.exists(downloaded_path):
                 await message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
                 return
 
