@@ -70,7 +70,8 @@ COOKIE_FILE = os.path.join(os.getcwd(), "cookies.txt")
 
 def get_cookiefile() -> str | None:
     """Agar cookies.txt mavjud bo'lsa, yo'lini qaytaradi, aks holda None.
-    YouTube cookies eskirgan yoki noto'g'ri bo'lsa, ularni ishlatmaydi."""
+    YouTube cookies eskirgan yoki Premium bo'lsa, ularni ishlatmaydi.
+    GitHub issue #15330: Premium cookies format tanlashni buzadi."""
     if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 100:
         try:
             with open(COOKIE_FILE, 'r', encoding='utf-8') as f:
@@ -80,18 +81,22 @@ def get_cookiefile() -> str | None:
             has_youtube = '.youtube.com' in cookie_content
             has_login = 'LOGIN_INFO' in cookie_content or 'SID' in cookie_content
 
-            if not has_youtube:
-                return None  # YouTube cookies yo'q
+            if not has_youtube or not has_login:
+                return COOKIE_FILE  # YouTube cookies yo'q, muammo emas
 
-            if not has_login:
-                return None  # Login cookies yo'q, anonim
+            # MUHIM: Premium subscription cookiesni tekshirish
+            # GitHub issue #15330: Premium cookies format tanlashni buzadi
+            # Premium cookies: "LOGIN_INFO" va "__Secure-1PSIDTS" birga bo'lsa
+            has_premium_indicators = (
+                'LOGIN_INFO' in cookie_content and 
+                ('__Secure-1PSIDTS' in cookie_content or '__Secure-3PSIDTS' in cookie_content)
+            )
 
-            # ESKI LOGICNI O'CHIRAMIZ: __Secure-1PSIDTS har qanday Google account'da bo'ladi
-            # Bu Premium emas, shuning uchun cookiesni o'chirmaymiz
-            # Faqat LOGIN_INFO va SID cookie'lari yetarli
+            if has_premium_indicators:
+                logging.warning("[COOKIES] YouTube Premium cookies aniqlandi. Format muammolarni oldini olish uchun cookies O'CHIRILDI.")
+                return None  # Premium cookiesni ishlatma!
 
             return COOKIE_FILE
-
         except Exception:
             return COOKIE_FILE
     return None
