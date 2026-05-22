@@ -70,7 +70,7 @@ COOKIE_FILE = os.path.join(os.getcwd(), "cookies.txt")
 
 def get_cookiefile() -> str | None:
     """Agar cookies.txt mavjud bo'lsa, yo'lini qaytaradi, aks holda None.
-    Instagram cookies faqat sessionid bo'lsa ishlatiladi."""
+    YouTube cookies eskirgan yoki noto'g'ri bo'lsa, ularni ishlatmaydi."""
     if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 100:
         try:
             with open(COOKIE_FILE, 'r', encoding='utf-8') as f:
@@ -78,20 +78,17 @@ def get_cookiefile() -> str | None:
 
             # YouTube cookies borligini tekshirish
             has_youtube = '.youtube.com' in cookie_content
-            has_youtube_login = 'LOGIN_INFO' in cookie_content or 'SID' in cookie_content
+            has_login = 'LOGIN_INFO' in cookie_content or 'SID' in cookie_content
 
-            # Instagram cookies tekshirish
-            has_instagram = '.instagram.com' in cookie_content
-            has_instagram_session = 'sessionid' in cookie_content.lower()
+            if not has_youtube:
+                return None  # YouTube cookies yo'q
 
-            # Agar faqat Instagram cookies bo'lsa va session yo'q bo'lsa, ishlatma
-            if has_instagram and not has_youtube and not has_instagram_session:
-                logging.info("[Cookies] Instagram cookies mavjud lekin sessionid yo'q. Anonim so'rov ishlatiladi.")
-                return None
+            if not has_login:
+                return None  # Login cookies yo'q, anonim
 
-            # YouTube uchun faqat login cookies bilan ishlatish
-            if has_youtube and not has_youtube_login:
-                return None
+            # ESKI LOGICNI O'CHIRAMIZ: __Secure-1PSIDTS har qanday Google account'da bo'ladi
+            # Bu Premium emas, shuning uchun cookiesni o'chirmaymiz
+            # Faqat LOGIN_INFO va SID cookie'lari yetarli
 
             return COOKIE_FILE
 
@@ -492,7 +489,9 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
 
 async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any] | None]:
     """
-    FIXED Instagram post yuklash - video va rasmni to'g'ri aniqlash bilan
+    Instagram post uchun ENG ISHONCHLI yuklash usuli.
+    Instagram 2024+ da anonim so'rovlarni bloklaydi, shuning uchun
+    embed sahifasini to'g'ri parse qilish va CDN linklarni olish.
     """
     def _download():
         import urllib.request
@@ -523,7 +522,7 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        # ========== USUL 1: Embed sahifa ==========
+        # ========== USUL 1: Embed sahifa (eng ishonchli 2026) ==========
         try:
             embed_url = f"https://www.instagram.com/p/{post_id}/embed/captioned/"
             headers = {
@@ -531,6 +530,9 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Referer': 'https://www.instagram.com/',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'same-origin',
             }
 
             req = urllib.request.Request(embed_url, headers=headers)
@@ -542,9 +544,8 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
             media_url = None
             is_video = False
             title = None
-            thumbnail_url = None
 
-            # 1. JSON-LD dan olish
+            # 1. JSON-LD dan olish (eng ishonchli)
             ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html, flags=re.S)
             if ld_json:
                 try:
@@ -555,41 +556,47 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                             is_video = True
                             logging.info(f"[Instagram] JSON-LD video URL: {media_url[:80] if media_url else 'None'}...")
                         elif 'image' in ld_data and isinstance(ld_data['image'], str):
-                            thumbnail_url = ld_data['image']
-                            logging.info(f"[Instagram] JSON-LD image URL: {thumbnail_url[:80] if thumbnail_url else 'None'}...")
+                            media_url = ld_data['image']
+                            logging.info(f"[Instagram] JSON-LD image URL: {media_url[:80] if media_url else 'None'}...")
+                        elif 'thumbnailUrl' in ld_data:
+                            media_url = ld_data['thumbnailUrl']
+                            logging.info(f"[Instagram] JSON-LD thumbnail URL: {media_url[:80] if media_url else 'None'}...")
                         if 'caption' in ld_data:
                             title = ld_data['caption']
                 except Exception as e:
                     logging.warning(f"[Instagram] JSON-LD parse xatolik: {e}")
 
-            # 2. og:video dan olish
-            if not media_url:
+            # 2. og:video dan olish (VIDEO uchun eng muhim!)
+            if not media_url or not is_video:
                 og_video = re.search(r'<meta[^>]+property="og:video"[^>]+content="(https://[^"]+)"', html)
                 if og_video:
                     media_url = og_video.group(1)
                     is_video = True
                     logging.info(f"[Instagram] og:video topildi: {media_url[:80]}...")
 
-            # 3. og:video:secure_url
-            if not media_url:
+            # 3. og:video:secure_url dan olish
+            if not media_url or not is_video:
                 og_video_secure = re.search(r'<meta[^>]+property="og:video:secure_url"[^>]+content="(https://[^"]+)"', html)
                 if og_video_secure:
                     media_url = og_video_secure.group(1)
                     is_video = True
+                    logging.info(f"[Instagram] og:video:secure_url topildi")
 
-            # 4. video tag
-            if not media_url:
+            # 4. video tag dan olish (src va data-src)
+            if not media_url or not is_video:
                 video_matches = re.findall(r'<video[^>]+(?:src|data-src)="(https://[^"]+)"', html)
                 if video_matches:
                     media_url = video_matches[0]
                     is_video = True
                     logging.info(f"[Instagram] video tag dan topildi: {media_url[:80]}...")
 
-            # 5. JS orqali video URL
-            if not media_url:
+            # 5. Instagram embed JS orqali video URL
+            if not media_url or not is_video:
+                # Embed sahifadagi video URL patternlari
                 video_url_patterns = [
                     r'"video_url":"(https://[^"]+\.mp4[^"]*)"',
                     r'"video_url":"([^"]+)"',
+                    r'video_url[^>]+>(https://[^<]+)',
                     r'src="(https://[^"]+instagram\.com[^"]+\.mp4[^"]*)"',
                 ]
                 for pattern in video_url_patterns:
@@ -600,17 +607,28 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                         logging.info(f"[Instagram] JS video URL topildi: {media_url[:80]}...")
                         break
 
-            # 6. Thumbnail (agar video topilmasa)
-            if not media_url and not thumbnail_url:
+            # 6. data-media-id orqali to'g'ridan-to'g'ri video URL yasash
+            if not media_url or not is_video:
+                media_id_match = re.search(r'data-media-id="(\d+)"', html)
+                if media_id_match:
+                    media_id = media_id_match.group(1)
+                    # Instagram'ning o'zining video endpointi
+                    media_url = f"https://www.instagram.com/reel/{post_id}/?utm_source=ig_embed&utm_campaign=loading"
+                    logging.info(f"[Instagram] Media ID orqali URL yasaldi: {media_id}")
+
+            # 7. og:image faqat rasm uchun (video bo'lsa SKIP!)
+            if not media_url and not is_video:
                 og_match = re.search(r'<meta[^>]+property="og:image"[^>]+content="(https://[^"]+scontent[^"]+)"', html)
                 if og_match:
-                    thumbnail_url = og_match.group(1)
-                    logging.info(f"[Instagram] og:image topildi (thumbnail): {thumbnail_url[:80]}...")
+                    media_url = og_match.group(1)
+                    logging.info(f"[Instagram] og:image topildi (faqat rasm): {media_url[:80]}...")
 
-            # ========== VIDEO YUKLASH ==========
-            if media_url and is_video:
+            if media_url:
+                # URL ni tozalash
                 media_url = media_url.replace('\u0026', '&').replace('&amp;', '&')
-                output_path = os.path.join(tempfile.gettempdir(), f"ig_embed_{post_id}.mp4")
+
+                ext = '.mp4' if is_video else '.jpg'
+                output_path = os.path.join(tempfile.gettempdir(), f"ig_embed_{post_id}{ext}")
 
                 req_media = urllib.request.Request(media_url, headers={
                     'User-Agent': headers['User-Agent'],
@@ -623,54 +641,29 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
 
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
                     file_size = os.path.getsize(output_path)
-                    logging.info(f"[Instagram] Fayl yuklandi: {file_size} bytes ({file_size/1024:.1f} KB)")
+                    logging.info(f"[Instagram] Embed usuli muvaffaqiyatli! Hajm: {file_size} bytes ({file_size/1024:.1f} KB)")
 
-                    # ===== MUHIM FIX: Fayl haqiqatan video ekanligini tekshirish =====
-                    with open(output_path, 'rb') as f_check:
-                        header = f_check.read(12)
-
-                    # MP4 signature tekshirish
-                    is_real_video = (
-                        header.startswith(b'\x00\x00\x00') and b'ftyp' in header[:20]
-                    ) or b'ftypmp42' in header[:20]
-
-                    # JPEG/PNG signature tekshirish (agar rasm bo'lsa)
-                    is_image = header.startswith(b'\xff\xd8\xff') or header.startswith(b'\x89PNG')
-
-                    if is_image:
-                        logging.warning(f"[Instagram] Fayl rasm ekan (JPEG/PNG), video emas. Thumbnail sifatida ishlatiladi.")
-                        new_path = output_path.rsplit('.', 1)[0] + '.jpg'
-                        os.rename(output_path, new_path)
-                        return new_path, {"title": title or f"Instagram {post_id}", "is_video": False}
-
-                    if not is_real_video and file_size < 1024 * 1024:  # 1MB dan kichik va video emas
-                        logging.warning(f"[Instagram] Fayl juda kichik ({file_size/1024:.1f} KB) va video emas. Boshqa usulga o'tish...")
-                        os.remove(output_path)
-                        media_url = None
+                    # Agar fayl juda kichik bo'lsa (masalan, 200KB dan kichik), bu ehtimol thumbnail
+                    if file_size < 200 * 1024 and is_video:
+                        logging.warning(f"[Instagram] Fayl juda kichik ({file_size/1024:.1f} KB), bu ehtimol thumbnail. Boshqa usulga o'tish...")
+                        # Faylni o'chirish va boshqa usulga o'tish
+                        try:
+                            os.remove(output_path)
+                        except:
+                            pass
+                        media_url = None  # Boshqa usulga o'tish
                     else:
-                        return output_path, {"title": title or f"Instagram {post_id}", "is_video": True}
-
-            # ========== RASM YUKLASH (agar video topilmasa) ==========
-            if thumbnail_url and not media_url:
-                thumbnail_url = thumbnail_url.replace('\u0026', '&').replace('&amp;', '&')
-                output_path = os.path.join(tempfile.gettempdir(), f"ig_embed_{post_id}.jpg")
-
-                req_img = urllib.request.Request(thumbnail_url, headers={
-                    'User-Agent': headers['User-Agent'],
-                    'Referer': 'https://www.instagram.com/',
-                })
-                with urllib.request.urlopen(req_img, timeout=30, context=ctx) as response:
-                    with open(output_path, 'wb') as f:
-                        f.write(response.read())
-
-                if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                    logging.info(f"[Instagram] Rasm yuklandi (video o'rniga)")
-                    return output_path, {"title": title or f"Instagram {post_id}", "is_video": False}
-
+                        return output_path, {"title": title or f"Instagram {post_id}"}
+                else:
+                    logging.warning(f"[Instagram] Fayl juda kichik yoki bo'sh")
+            else:
+                logging.warning(f"[Instagram] Embed sahifadan media URL topilmadi")
+                # Debug: HTML'dan birinchi 500 ta belgini ko'rsatish
+                logging.debug(f"[Instagram] HTML snippet: {html[:500]}")
         except Exception as e:
             logging.warning(f"[Instagram] Embed usuli xatolik: {e}")
 
-        # ========== USUL 2: Post sahifasi ==========
+        # ========== USUL 2: To'g'ridan-to'g'ri post sahifasi ==========
         try:
             post_url = f"https://www.instagram.com/p/{post_id}/"
             headers = {
@@ -684,9 +677,12 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
             with urllib.request.urlopen(req, timeout=20, context=ctx) as response:
                 html = response.read().decode('utf-8', errors='ignore')
 
+            logging.info(f"[Instagram] Post sahifa yuklandi. Uzunlik: {len(html)}")
+
             media_url = None
             is_video = False
 
+            # JSON-LD
             ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html, flags=re.S)
             if ld_json:
                 try:
@@ -697,19 +693,45 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                             is_video = True
                         elif 'image' in ld_data and isinstance(ld_data['image'], str):
                             media_url = ld_data['image']
+                        elif 'thumbnailUrl' in ld_data:
+                            media_url = ld_data['thumbnailUrl']
                 except Exception:
                     pass
 
+            # og:image
             if not media_url:
                 og_match = re.search(r'<meta[^>]+property="og:image"[^>]+content="(https://[^"]+scontent[^"]+)"', html)
                 if og_match:
                     media_url = og_match.group(1)
 
+            # og:video
             if not media_url:
                 og_video = re.search(r'<meta[^>]+property="og:video"[^>]+content="(https://[^"]+)"', html)
                 if og_video:
                     media_url = og_video.group(1)
                     is_video = True
+
+            # _sharedData
+            if not media_url:
+                shared_data = re.search(r'window\._sharedData\s*=\s*(\{.*?\});</script>', html, flags=re.S)
+                if shared_data:
+                    try:
+                        data = json.loads(shared_data.group(1))
+                        media = data.get('entry_data', {}).get('PostPage', [{}])[0].get('graphql', {}).get('shortcode_media', {})
+                        if media.get('is_video'):
+                            is_video = True
+                            media_url = media.get('video_url')
+                        if not media_url:
+                            media_url = media.get('display_url')
+                    except Exception:
+                        pass
+
+            # scontent CDN qidirish
+            if not media_url:
+                cdn_matches = re.findall(r'(https://[^"\s<>]+scontent[^"\s<>]+\.(?:jpg|jpeg|png|webp|mp4))', html)
+                if cdn_matches:
+                    # Eng katta URL ni tanlash (odatda eng yuqori sifatli)
+                    media_url = max(cdn_matches, key=len)
 
             if media_url:
                 media_url = media_url.replace('\u0026', '&').replace('&amp;', '&')
@@ -722,14 +744,41 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                         f.write(response.read())
 
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                    return output_path, {"title": f"Instagram {post_id}", "is_video": is_video}
+                    logging.info(f"[Instagram] Post page usuli muvaffaqiyatli!")
+                    return output_path, {"title": f"Instagram {post_id}"}
         except Exception as e:
             logging.warning(f"[Instagram] Post page xatolik: {e}")
+
+        # ========== USUL 3: Instagram CDN to'g'ridan-to'g'ri ==========
+        try:
+            # Instagram'ning o'zining media endpointi
+            cdn_url = f"https://www.instagram.com/p/{post_id}/media/?size=l"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+                'Referer': 'https://www.instagram.com/',
+            }
+
+            req = urllib.request.Request(cdn_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
+                # Bu redirect qiladi yoki to'g'ridan-to'g'ri rasm beradi
+                final_url = response.geturl()
+                if final_url != cdn_url:
+                    logging.info(f"[Instagram] CDN redirect: {final_url[:80]}...")
+                    output_path = os.path.join(tempfile.gettempdir(), f"ig_cdn_{post_id}.jpg")
+                    with open(output_path, 'wb') as f:
+                        f.write(response.read())
+
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                        return output_path, {"title": f"Instagram {post_id}"}
+        except Exception as e:
+            logging.warning(f"[Instagram] CDN xatolik: {e}")
 
         logging.error(f"[Instagram] Barcha usullar ishlamadi. Post ID: {post_id}")
         return None, None
 
     return await asyncio.to_thread(_download)
+
 
 
 async def download_instagram_embed(url: str) -> str | None:
@@ -1061,7 +1110,7 @@ TEXTS = {
             "✨ @skachatinstavideo_bot ga xush kelibsiz!\n\n"
             "🎵 Nom, ijrochi, matn yoki link orqali qidiruv.\n"
             "🎙 Ovozli xabar va video orqali musiqani aniqlash.\n"
-            "📎 Instagram, TikTok, YouTube va boshqa ijtimoiy tarmoqlardan media yuboring.\n\n"
+            "📎 Instagram, YouTube va boshqa ijtimoiy tarmoqlardan media yuboring.\n\n"
             "🔗 Link, 🎙 Voice yoki 📝 Matn yuboring!"
         ),
         "force_sub": "❌ <b>Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:</b>",
@@ -1205,7 +1254,7 @@ TEXTS = {
             "✨ @skachatinstavideo_bot га хуш келибсиз!\n\n"
             "🎵 Ном, ижрочи, матн ёки линк орқали қидириш.\n"
             "🎙 Овозли хабар ва видео орқали мусиқани аниқлаш.\n"
-            "📎 Instagram, TikTok, YouTube ва бошқа ижтимоий тармоқлардан медиа юборинг.\n\n"
+            "📎 Instagram, YouTube ва бошқа ижтимоий тармоқлардан медиа юборинг.\n\n"
             "🔗 Линк, 🎙 Voice ёки 📝 Матн юборинг!"
         ),
         "force_sub": "❌ <b>Ботдан фойдаланиш учун қуйидаги каналларга аъзо бўлинг:</b>",
@@ -1349,7 +1398,7 @@ TEXTS = {
             "✨ Добро пожаловать в @skachatinstavideo_bot!\n\n"
             "🎵 Поиск по названию, исполнителю, тексту или ссылке.\n"
             "🎙 Голосовое сообщение и видео для распознавания музыки.\n"
-            "📎 Загружайте медиа из Instagram, TikTok, YouTube и других сетей.\n\n"
+            "📎 Загружайте медиа из Instagram, YouTube и других сетей.\n\n"
             "Отправьте 🔗 Ссылку, 🎙 Голос или 📝 Текст!"
         ),
         "force_sub": "❌ <b>Для использования бота подпишитесь на каналы:</b>",
@@ -1493,7 +1542,7 @@ TEXTS = {
             "✨ Welcome to @skachatinstavideo_bot!\n\n"
             "🎵 <b>Music search</b> — by name, artist, lyrics\n"
             "🎙 <b>Voice message</b> — identify music\n"
-            "📎 <b>Link</b> — download video/photo from Instagram, TikTok, YouTube and other social networks\n\n"
+            "📎 <b>Link</b> — download video/photo from Instagram, YouTube and other social networks\n\n"
             "Send a 🔗 <b>Link</b>, 🎙 <b>Voice</b>, 📝 <b>Text</b>!"
         ),
         "force_sub": "❌ <b>Please subscribe to these channels to use the bot:</b>",
@@ -2181,8 +2230,7 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
                 })
 
             # Cookies faqat so'ralganda qo'shiladi
-            # FIXED: Instagram uchun cookies ishlatma (rate limitni tezlashtiradi)
-            if cookie_path and "instagram" not in url.lower():
+            if cookie_path:
                 ydl_opts['cookiefile'] = cookie_path
 
             if extra_opts:
@@ -3104,14 +3152,7 @@ async def text_handler(message: Message):
                         file_size_mb = os.path.getsize(direct_path) / (1024 * 1024)
                         ext = direct_path.split(".")[-1].lower()
 
-                        # FIXED: is_video metadata dan foydalanish
-                        is_actually_video = direct_meta.get("is_video", False) if direct_meta else False
-
-                        # Agar metadata yo'q bo'lsa, ext orqali tekshirish
-                        if not is_actually_video:
-                            is_actually_video = ext in ('mp4', 'mov', 'avi', 'mkv', 'webm')
-
-                        if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp') or not is_actually_video:
+                        if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'):
                             # Rasm
                             if file_size_mb <= 10:
                                 await message.answer_photo(
@@ -3183,8 +3224,6 @@ async def text_handler(message: Message):
 
                     # Hamma usul ishlamasa
                     logging.error(f"[Instagram] Barcha usullar ishlamadi: {message.text}")
-                    # Rate limiting oldini olish uchun 2 soniya kutish
-                    await asyncio.sleep(2)
                     await message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
                     return
 
