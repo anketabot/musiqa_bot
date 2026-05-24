@@ -192,7 +192,7 @@ async def check_subscriptions(bot: Bot, user_id: int, channels: list) -> bool:
 
 
 async def search_youtube_tracks(query: str, max_results: int = 15) -> list:
-    """YouTube orqali qo'shiqlarni qidiradi - 2026-05-24 yangilangan"""
+    """YouTube orqali qo'shiqlarni qidiradi (cookies siz ham ishlaydi)."""
     def _search():
         opts = {
             "quiet": True,
@@ -202,66 +202,36 @@ async def search_youtube_tracks(query: str, max_results: int = 15) -> list:
             "playlistend": max_results,
             "default_search": "ytsearch",
             "socket_timeout": 10,
-            "retries": 3,
-            "ignoreerrors": True,
-            "sleep_requests": 1,
-            "sleep_interval": 1,
+            "retries": 2,
+            "ignoreerrors": True,  # Xatoliklarni e'tiborsiz qoldirish
             "headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept-Language": "en-US,en;q=0.9",
             },
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["mweb"],
-                    "formats": "missing_pot",
-                }
-            },
         }
 
+        # YouTube cookies.txt mavjud bo'lsa - lekin avval SIZ urinib ko'ramiz
         cookie_path = get_cookiefile()
-        proxy_url = os.getenv("YOUTUBE_PROXY", None)
 
-        def _do_search(use_cookies: bool = True, use_proxy: bool = False):
+        def _do_search(use_cookies: bool = True):
             opts_copy = dict(opts)
             if use_cookies and cookie_path:
                 opts_copy["cookiefile"] = cookie_path
-            if use_proxy and proxy_url:
-                opts_copy["proxy"] = proxy_url
             try:
                 with yt_dlp.YoutubeDL(opts_copy) as ydl:
                     info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
                     return info.get("entries", []) or [] if info else []
             except Exception as e:
-                logging.warning(f"YouTube qidiruv xatosi (cookies={'ha' if use_cookies else 'yo\'q'}, proxy={'ha' if use_proxy else 'yo\'q'}): {e}")
+                logging.warning(f"YouTube qidiruv xatosi (cookies={'ha' if use_cookies else 'yo\'q'}): {e}")
                 return []
 
-        # 1. Avval cookies SIZ, proxy yo'q
-        results = _do_search(use_cookies=False, use_proxy=False)
+        # Avval cookies SIZ, keyin cookies BILAN
+        results = _do_search(use_cookies=False)
         if results:
             return results
-
-        # 2. Cookies SIZ, proxy bilan
-        if proxy_url:
-            results = _do_search(use_cookies=False, use_proxy=True)
-            if results:
-                return results
-
-        # 3. Cookies BILAN (agar yuqoridagilar ishlamasa)
-        results = _do_search(use_cookies=True, use_proxy=False)
-        if results:
-            return results
-
-        # 4. Cookies BILAN, proxy bilan
-        if proxy_url:
-            results = _do_search(use_cookies=True, use_proxy=True)
-            if results:
-                return results
-
-        return []
+        return _do_search(use_cookies=True)
 
     return await asyncio.to_thread(_search)
-
-
 
 
 async def download_youtube_audio(url: str, filename: str) -> str | None:
@@ -323,19 +293,18 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
 
 
 def download_youtube_audio_sync(url: str, filename: str) -> str | None:
-    """Sinxron versiya - YouTube bot detection muammosini hal qilish uchun"""
+    """Sinxron versiya — 403 va format xatoliklarini hal qiladi"""
     safe = re.sub(r'[\\/*?:"<>|]', "_", filename)
     ffmpeg_cmd = find_ffmpeg_cmd()
     cookie_path = get_cookiefile()
 
-    # Proxy sozlamalari
-    proxy_url = os.getenv("YOUTUBE_PROXY", None)
-
-    def _try_download(prefix: str, extra_opts: dict, use_cookies: bool = True, use_proxy: bool = False) -> str | None:
+    def _try_download(prefix: str, extra_opts: dict, use_cookies: bool = True) -> str | None:
         output_path = os.path.join(tempfile.gettempdir(), f"{prefix}_{safe}.%(ext)s")
 
+        # ASOSIY sozlamalar - formatni moslashuvchan qilamiz
         opts = {
-            'format': 'bestaudio/best',
+            # 'bestaudio/best' o'rniga - avval audio, keyin video+audio, keyin istalgan format
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best',
             'outtmpl': output_path,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
@@ -345,28 +314,25 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
-            'ignoreerrors': True,
+            'ignoreerrors': True,  # Xatoliklarni e'tiborsiz qoldirish
             'socket_timeout': 30,
             'retries': 3,
             'sleep_requests': 2,
             'sleep_interval': 1,
+            # PO Token bilan muammolarni oldini olish
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['mweb'],
+                    'player_client': ['mweb'],  # mweb eng ishonchli
                     'formats': 'missing_pot',
                 }
             },
         }
-
         if ffmpeg_cmd:
             opts['ffmpeg_location'] = os.path.dirname(ffmpeg_cmd)
-
-        if use_proxy and proxy_url:
-            opts['proxy'] = proxy_url
-
+        # MUHIM: Cookies faqat so'rovda aytilsa qo'shiladi
+        # GitHub issue #15330: cookies format tanlashni buzishi mumkin
         if use_cookies and cookie_path:
             opts['cookiefile'] = cookie_path
-
         opts.update(extra_opts)
 
         try:
@@ -375,21 +341,25 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
                 if not info:
                     return None
 
+                # Agar postprocessor ishlamasa, original faylni qaytarish
                 downloaded = ydl.prepare_filename(info)
                 mp3_path = downloaded.rsplit(".", 1)[0] + ".mp3"
 
+                # ===== MUHIM FIX: Yuklangan fayl haqiqatan audio ekanligini tekshirish =====
                 check_path = mp3_path if os.path.exists(mp3_path) else downloaded
                 if os.path.exists(check_path):
                     with open(check_path, 'rb') as f_check:
                         header = f_check.read(100)
 
+                    # Agar fayl HTML bo'lsa (bot check page), uni o'chirish
                     if header.startswith(b'<!DOCTYPE') or header.startswith(b'<html') or b'<HTML' in header[:50]:
-                        logging.warning(f"[Audio] Yuklangan fayl HTML sahifa (bot check).")
+                        logging.warning(f"[Audio] Yuklangan fayl HTML sahifa (bot check). Cookies eskirgan bo'lishi mumkin.")
                         os.remove(check_path)
-                        return "__EXPIRED_COOKIES__"
+                        return "__EXPIRED_COOKIES__"  # Maxsus marker
 
+                    # Agar fayl juda kichik bo'lsa (< 1KB), xato
                     if os.path.getsize(check_path) < 1024:
-                        logging.warning(f"[Audio] Fayl juda kichik")
+                        logging.warning(f"[Audio] Fayl juda kichik, ehtimol xato sahifa")
                         os.remove(check_path)
                         return None
 
@@ -398,37 +368,40 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
                 if os.path.exists(downloaded):
                     return downloaded
 
-                base = os.path.join(tempfile.gettempdir(), f"{prefix}_{safe}")
-                for ext in ['.mp3', '.m4a', '.webm', '.opus', '.mp4']:
-                    p = base + ext
-                    if os.path.exists(p) and os.path.getsize(p) > 1024:
-                        with open(p, 'rb') as f_check:
-                            h = f_check.read(50)
-                        if not (h.startswith(b'<!DOCTYPE') or h.startswith(b'<html') or b'<HTML' in h[:50]):
-                            return p
-                        else:
-                            os.remove(p)
+            # Faylni topish (fallback)
+            base = os.path.join(tempfile.gettempdir(), f"{prefix}_{safe}")
+            for ext in ['.mp3', '.m4a', '.webm', '.opus', '.mp4']:
+                p = base + ext
+                if os.path.exists(p) and os.path.getsize(p) > 1024:
+                    # HTML emasligini tekshirish
+                    with open(p, 'rb') as f_check:
+                        h = f_check.read(50)
+                    if not (h.startswith(b'<!DOCTYPE') or h.startswith(b'<html') or b'<HTML' in h[:50]):
+                        return p
+                    else:
+                        os.remove(p)  # HTML faylni o'chirish
 
-                files = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(f"{prefix}_{safe}")]
-                valid_files = []
-                for f in files:
-                    p = os.path.join(tempfile.gettempdir(), f)
-                    if os.path.getsize(p) > 1024:
-                        with open(p, 'rb') as f_check:
-                            h = f_check.read(50)
-                        if not (h.startswith(b'<!DOCTYPE') or h.startswith(b'<html') or b'<HTML' in h[:50]):
-                            valid_files.append(f)
-                        else:
-                            os.remove(p)
+            # Fallback: eng yangi faylni qidirish
+            files = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(f"{prefix}_{safe}")]
+            valid_files = []
+            for f in files:
+                p = os.path.join(tempfile.gettempdir(), f)
+                if os.path.getsize(p) > 1024:
+                    with open(p, 'rb') as f_check:
+                        h = f_check.read(50)
+                    if not (h.startswith(b'<!DOCTYPE') or h.startswith(b'<html') or b'<HTML' in h[:50]):
+                        valid_files.append(f)
+                    else:
+                        os.remove(p)
 
-                if valid_files:
-                    return os.path.join(tempfile.gettempdir(), sorted(
-                        valid_files,
-                        key=lambda x: os.path.getmtime(os.path.join(tempfile.gettempdir(), x)),
-                        reverse=True
-                    )[0])
+            if valid_files:
+                return os.path.join(tempfile.gettempdir(), sorted(
+                    valid_files,
+                    key=lambda x: os.path.getmtime(os.path.join(tempfile.gettempdir(), x)),
+                    reverse=True
+                )[0])
 
-                return None
+            return None
         except Exception as e:
             err = str(e)
             if '403' in err:
@@ -439,20 +412,22 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
                 logging.warning(f"Download attempt ({prefix}) failed: {e}")
         return None
 
-    # ASOSIY STRATEGIYA: Avval COOKIES SIZ urinish
+    # ===== UPDATED: Cookies eskirgan bo'lsa, keyingi urinishga o'tish =====
 
-    # 1-urinish: mweb client, COOKIES SIZ
+    # 1-urinish: mweb client, COOKIES SIZ (eng ishonchli)
     result = _try_download("dl", {}, use_cookies=False)
     if result and result != "__EXPIRED_COOKIES__":
         return result
 
-    # 2-urinish: mweb client, COOKIES SIZ, proxy bilan
-    if proxy_url:
-        result = _try_download("dl_proxy", {}, use_cookies=False, use_proxy=True)
-        if result and result != "__EXPIRED_COOKIES__":
+    # 2-urinish: mweb client, cookies BILAN (agar login talab qilinsa)
+    result = _try_download("dl_cook", {}, use_cookies=True)
+    if result:
+        if result == "__EXPIRED_COOKIES__":
+            logging.info("[Audio] Cookies eskirgan, anonim urinishga o'tish...")
+        else:
             return result
 
-    # 3-urinish: tv client, COOKIES SIZ
+    # 3-urinish: tv client (cookies bilan)
     result = _try_download("dl_tv", {
         'extractor_args': {
             'youtube': {
@@ -460,11 +435,14 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
                 'formats': 'missing_pot',
             }
         },
-    }, use_cookies=False)
-    if result and result != "__EXPIRED_COOKIES__":
-        return result
+    }, use_cookies=True)
+    if result:
+        if result == "__EXPIRED_COOKIES__":
+            pass  # Keyingi urinishga o'tish
+        else:
+            return result
 
-    # 4-urinish: android_vr client, COOKIES SIZ
+    # 4-urinish: android_vr (PO Token talab qilmaydi)
     result = _try_download("dl_vr", {
         'extractor_args': {
             'youtube': {
@@ -473,13 +451,13 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
             }
         },
         'headers': {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36',
         },
     }, use_cookies=False)
     if result and result != "__EXPIRED_COOKIES__":
         return result
 
-    # 5-urinish: web_embedded client, COOKIES SIZ
+    # 5-urinish: web_embedded (PO Token talab qilmaydi, faqat embeddable)
     result = _try_download("dl_emb", {
         'extractor_args': {
             'youtube': {
@@ -491,33 +469,23 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
     if result and result != "__EXPIRED_COOKIES__":
         return result
 
-    # 6-urinish: ios client, COOKIES SIZ
+    # 6-urinish: android (cookies bilan)
+    result = _try_download("dl_and", {
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android'],
+                'formats': 'missing_pot',
+            }
+        },
+    }, use_cookies=True)
+    if result and result != "__EXPIRED_COOKIES__":
+        return result
+
+    # 7-urinish: ios (cookies bilan)
     result = _try_download("dl_ios", {
         'extractor_args': {
             'youtube': {
                 'player_client': ['ios'],
-                'formats': 'missing_pot',
-            }
-        },
-    }, use_cookies=False)
-    if result and result != "__EXPIRED_COOKIES__":
-        return result
-
-    # COOKIES BILAN URINISHLAR
-
-    # 7-urinish: mweb client, cookies BILAN
-    result = _try_download("dl_cook", {}, use_cookies=True)
-    if result:
-        if result == "__EXPIRED_COOKIES__":
-            logging.info("[Audio] Cookies eskirgan, boshqa usullarga o'tish...")
-        else:
-            return result
-
-    # 8-urinish: tv client, cookies BILAN
-    result = _try_download("dl_tv_cook", {
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['tv'],
                 'formats': 'missing_pot',
             }
         },
@@ -527,9 +495,6 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
 
     logging.error(f"[Audio] Barcha usullar ishlamadi: {url}")
     return None
-
-
-
 
 async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any] | None]:
     """
@@ -2104,16 +2069,36 @@ async def resolve_short_url(url: str) -> str:
 async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
     """
     Instagram, YouTube va boshqa platformalardan video/rasm yuklash.
-    2026-05-24 yangilangan - YouTube bot detection muammosini hal qilish.
+    Pinterest'da video topilmasa rasm yuklaydi (fallback).
     """
 
-    # Proxy sozlamalari
-    proxy_url = os.getenv("YOUTUBE_PROXY", None)
+    # ==================== PROXY SOZLAMALARI ====================
+    # Proxy ni yoqish/o'chirish - True/False
+    USE_PROXY = False
+
+    # HTTP Proxy (agar kerak bo'lsa) - o'zingizning proxyingizni kiriting
+    # Format: "http://user:pass@host:port" yoki "http://host:port"
+    HTTP_PROXY = "http://user:pass@proxy_host:port"
+    HTTPS_PROXY = "http://user:pass@proxy_host:port"
+    SOCKS_PROXY = "socks5://user:pass@proxy_host:port"  # SOCKS5 proxy
+
+    # Tekshirilgan bepul proxy ro'yxati (ishlaydiganini tanlang)
+    # Eslatma: Bepul proxy tez-tez o'zgaradi, o'zingizning proxyingizni ishlating
+    # Webshare.io - 10 ta bepul proxy (ro'yxatdan o'tish kerak)
+    # Bright Data - 15 ta bepul proxy + 2GB/oy
+    FREE_PROXIES = [
+        None,  # Proxy siz (birinchi urinish)
+        # Quyidagilarni o'zingizning proxyingiz bilan almashtiring:
+        # "http://proxy1.example.com:8080",
+        # "http://proxy2.example.com:3128",
+        # "socks5://127.0.0.1:1080",  # Local SOCKS5 (masalan, Tor)
+    ]
+    # ==========================================================
 
     def _download():
         cookie_path = get_cookiefile()
 
-        def _try_video_download(prefix: str, use_cookies: bool = True, extra_opts: dict = None, proxy: str = None) -> tuple[str | None, dict] | None:
+        def _try_video_download(prefix: str, use_cookies: bool = True, extra_opts: dict = None, proxy_url: str = None) -> tuple[str | None, dict] | None:
             output_template = os.path.join(tempfile.gettempdir(), f"{prefix}_{datetime.now().timestamp():.0f}_%(ext)s")
 
             ydl_opts = {
@@ -2134,29 +2119,25 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                     'Accept-Language': 'en-US,en;q=0.5',
                 },
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['mweb'],
-                        'formats': 'missing_pot',
-                    }
-                },
             }
 
-            if proxy:
-                ydl_opts['proxy'] = proxy
-                logging.info(f"[Proxy] Proxy ishlatilmoqda: {proxy[:30]}...")
+            # Proxy sozlamalari
+            if USE_PROXY and proxy_url:
+                ydl_opts['proxy'] = proxy_url
+                logging.info(f"[Proxy] Proxy ishlatilmoqda: {proxy_url[:30]}...")
 
-            # Instagram uchun maxsus sozlamalar
-            if "instagram" in url.lower():
+            # Threads uchun maxsus sozlamalar
+            if "threads" in url.lower():
                 ydl_opts.update({
-                    'extract_flat': False,
-                    'playlist_items': '1',
+                    'extractor_args': {
+                        'generic': {
+                            'referer': 'https://www.threads.net/',
+                        }
+                    },
                 })
-                # Instagram uchun cookies ishlatma (rate limit)
-                use_cookies = False
-
-            # TikTok uchun maxsus sozlamalar
-            if "tiktok" in url.lower():
+            
+            # TikTok uchun maxsus sozlamalar (qisqa linklar uchun MUHIM)
+            if "tiktok" in url.lower() or "vt.tiktok" in url.lower() or "vm.tiktok" in url.lower():
                 ydl_opts.update({
                     'extractor_args': {
                         'tiktok': {
@@ -2165,22 +2146,49 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
                         }
                     },
                     'headers': {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5',
                         'Referer': 'https://www.tiktok.com/',
+                    },
+                    'geo_bypass': True,
+                    'geo_bypass_country': 'US',
+                })
+            
+            # Instagram uchun maxsus sozlamalar
+            if "instagram" in url.lower():
+                ydl_opts.update({
+                    'extract_flat': False,
+                    'playlist_items': '1',
+                    'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best',
+                })
+
+            # Likee uchun maxsus sozlamalar
+            if "likee" in url.lower():
+                ydl_opts.update({
+                    'extractor_args': {
+                        'likee': {
+                            'app_id': 'likee-2311',
+                        }
                     },
                 })
 
-            # YouTube uchun cookies faqat kerak bo'lsa
-            if "youtube" in url.lower() or "youtu.be" in url.lower():
-                # Avval cookies SIZ urinish
-                if not use_cookies:
-                    pass  # Cookies qo'shilmaydi
-                elif cookie_path:
-                    ydl_opts['cookiefile'] = cookie_path
-            else:
-                # Boshqa platformalar uchun cookies
-                if use_cookies and cookie_path:
-                    ydl_opts['cookiefile'] = cookie_path
+            
+            # Pinterest uchun maxsus sozlamalar
+            if "pinterest" in url.lower():
+                ydl_opts.update({
+                    'extractor_args': {
+                        'pinterest': {
+                            'no_check_certificate': True,
+                        }
+                    },
+                    'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best/bestimage/best',  # Rasm ham qidirish
+                })
+
+            # Cookies faqat so'ralganda qo'shiladi
+            # FIXED: Instagram uchun cookies ishlatma (rate limitni tezlashtiradi)
+            if cookie_path and "instagram" not in url.lower():
+                ydl_opts['cookiefile'] = cookie_path
 
             if extra_opts:
                 ydl_opts.update(extra_opts)
@@ -2215,31 +2223,28 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
                 logging.warning(f"Video yuklashda xatolik ({prefix}, cookies={'ha' if use_cookies else 'yo\'q'}): {e}")
             return None
 
-        # Urinishlar
-        proxies_to_try = [None]
-        if proxy_url:
-            proxies_to_try.append(proxy_url)
+        # Proxy bilan yuklash urinishlari
+        proxies_to_try = FREE_PROXIES if USE_PROXY else [None]
 
         for proxy in proxies_to_try:
             proxy_str = proxy[:30] + "..." if proxy and len(proxy) > 30 else (proxy or "Yo'q")
-            logging.info(f"[Download] Proxy: {proxy_str}")
+            logging.info(f"[TikTok] Proxy: {proxy_str}")
 
-            # 1-urinish: Cookies SIZ
-            result = _try_video_download("dl", use_cookies=False, proxy=proxy)
+            # 1-urinish: Cookies SIZ, proxy bilan/yo'q
+            result = _try_video_download("dl", use_cookies=False, proxy_url=proxy)
             if result and result[0]:
                 return result
 
             # 2-urinish: Cookies BILAN
-            result = _try_video_download("dl_cook", use_cookies=True, proxy=proxy)
+            result = _try_video_download("dl_cook", use_cookies=True, proxy_url=proxy)
             if result and result[0]:
                 return result
 
-            # 3-urinish: Android client, cookies SIZ
-            result = _try_video_download("dl_and", use_cookies=False, proxy=proxy, extra_opts={
+            # 3-urinish: Android client
+            result = _try_video_download("dl_and", use_cookies=False, proxy_url=proxy, extra_opts={
                 'extractor_args': {
-                    'youtube': {
-                        'player_client': ['android_vr'],
-                        'formats': 'missing_pot',
+                    'tiktok': {
+                        'app_info': '1180',
                     }
                 },
                 'headers': {
@@ -2250,7 +2255,7 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
                 return result
 
             # 4-urinish: Worst quality
-            result = _try_video_download("dl_worst", use_cookies=False, proxy=proxy, extra_opts={
+            result = _try_video_download("dl_worst", use_cookies=False, proxy_url=proxy, extra_opts={
                 'format': 'worst',
             })
             if result and result[0]:
@@ -2259,18 +2264,15 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
         return None, None
 
     result = await asyncio.to_thread(_download)
-
-    # Pinterest fallback
+    
+    # Pinterest fallback - agar video topilmasa rasm yuklashga urinish
     if "pinterest" in url.lower() and (result is None or result[0] is None):
         logging.info("[Pinterest] Video topilmadi, rasm yuklanmoqda (fallback)...")
         fallback_result = await download_pinterest_fallback(url)
         if fallback_result and fallback_result[0]:
             return fallback_result
-
+    
     return result
-
-
-
 
 async def download_pinterest_fallback(url: str) -> tuple[str | None, dict[str, Any] | None]:
     """Pinterest'dan rasm yuklash (yt-dlp ishlamaganda fallback)"""
@@ -2417,17 +2419,16 @@ async def download_pinterest_fallback(url: str) -> tuple[str | None, dict[str, A
 
 async def download_audio_by_query(query: str) -> str | None:
     """
-    YouTube'dan audio qidirish va yuklash - 2026-05-24 yangilangan.
+    YouTube'dan audio qidirish va yuklash.
     query: "artist - title" formatida
     """
     def _download():
         cookie_path = get_cookiefile()
-        proxy_url = os.getenv("YOUTUBE_PROXY", None)
 
-        def _try_audio(use_cookies: bool = True, use_proxy: bool = False) -> str | None:
+        def _try_audio(use_cookies: bool = True) -> str | None:
             output_path = os.path.join(tempfile.gettempdir(), f"audio_{datetime.now().timestamp():.0f}.%(ext)s")
             ydl_opts = {
-                'format': 'bestaudio/best',
+                'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best',
                 'outtmpl': output_path,
                 'quiet': True,
                 'no_warnings': True,
@@ -2442,16 +2443,7 @@ async def download_audio_by_query(query: str) -> str | None:
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                     'Accept-Language': 'en-US,en;q=0.9',
                 },
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['mweb'],
-                        'formats': 'missing_pot',
-                    }
-                },
             }
-
-            if use_proxy and proxy_url:
-                ydl_opts['proxy'] = proxy_url
 
             # Cookies faqat so'ralganda
             if use_cookies and cookie_path:
@@ -2489,31 +2481,13 @@ async def download_audio_by_query(query: str) -> str | None:
             return None
 
         # Avval cookies SIZ, keyin cookies BILAN
-        result = _try_audio(use_cookies=False, use_proxy=False)
+        result = _try_audio(use_cookies=False)
         if result:
             return result
-
-        # Proxy bilan
-        if proxy_url:
-            result = _try_audio(use_cookies=False, use_proxy=True)
-            if result:
-                return result
-
-        result = _try_audio(use_cookies=True, use_proxy=False)
-        if result:
-            return result
-
-        if proxy_url:
-            result = _try_audio(use_cookies=True, use_proxy=True)
-            if result:
-                return result
-
-        return None
+        return _try_audio(use_cookies=True)
 
     return await asyncio.to_thread(_download)
 
-
-# ========================== FILE UTILS ==========================
 
 # ========================== FILE UTILS ==========================
 def _cleanup_file(path: str):
