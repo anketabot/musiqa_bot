@@ -66,7 +66,8 @@ BOT_USERNAME = "skachatinstavideo_bot"
 # ========================== UNIFIED COOKIE HELPER ==========================
 # Barcha platformalar uchun BIR cookie fayl
 COOKIE_FILE = os.path.join(os.getcwd(), "cookies.txt")
-
+YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "http://brd-customer-hl_584f7991-zone-freemium:3632uaq238wz@brd.superproxy.io:33335")
+INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "http://brd-customer-hl_584f7991-zone-freemium:3632uaq238wz@brd.superproxy.io:33335")
 
 def get_cookiefile() -> str | None:
     """Agar cookies.txt mavjud bo'lsa, yo'lini qaytaradi, aks holda None.
@@ -203,14 +204,17 @@ async def search_youtube_tracks(query: str, max_results: int = 15) -> list:
             "default_search": "ytsearch",
             "socket_timeout": 10,
             "retries": 2,
-            "ignoreerrors": True,  # Xatoliklarni e'tiborsiz qoldirish
+            "ignoreerrors": True,
             "headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept-Language": "en-US,en;q=0.9",
             },
         }
 
-        # YouTube cookies.txt mavjud bo'lsa - lekin avval SIZ urinib ko'ramiz
+        # PROXY qo'shish
+        if YOUTUBE_PROXY:
+            opts["proxy"] = YOUTUBE_PROXY
+
         cookie_path = get_cookiefile()
 
         def _do_search(use_cookies: bool = True):
@@ -225,7 +229,16 @@ async def search_youtube_tracks(query: str, max_results: int = 15) -> list:
                 logging.warning(f"YouTube qidiruv xatosi (cookies={'ha' if use_cookies else 'yo\'q'}): {e}")
                 return []
 
-        # Avval cookies SIZ, keyin cookies BILAN
+        # Avval PROXY + cookies BILAN, keyin proxy + cookies SIZ
+        if YOUTUBE_PROXY:
+            results = _do_search(use_cookies=True)
+            if results:
+                return results
+            results = _do_search(use_cookies=False)
+            if results:
+                return results
+        
+        # Proxy siz
         results = _do_search(use_cookies=False)
         if results:
             return results
@@ -233,6 +246,28 @@ async def search_youtube_tracks(query: str, max_results: int = 15) -> list:
 
     return await asyncio.to_thread(_search)
 
+def check_youtube_cookies_valid() -> bool:
+    """YouTube cookies hali ishlayotganini tekshirish"""
+    cookie_path = get_cookiefile()
+    if not cookie_path:
+        return False
+    
+    import subprocess
+    try:
+        result = subprocess.run([
+            'yt-dlp', '--cookies', cookie_path, 
+            '--simulate', '--print', '%(title)s',
+            'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+        ], capture_output=True, text=True, timeout=30)
+        
+        if result.returncode == 0 and 'Rick Astley' in result.stdout:
+            return True
+        if 'bot' in result.stderr.lower() or 'sign in' in result.stderr.lower():
+            logging.error("[Cookies] YouTube cookies eskirgan! Yangilang.")
+            return False
+    except Exception:
+        pass
+    return False
 
 async def download_youtube_audio(url: str, filename: str) -> str | None:
     """YouTube dan mp3 yuklab oladi (cookies siz ham ishlaydi)."""
@@ -293,17 +328,15 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
 
 
 def download_youtube_audio_sync(url: str, filename: str) -> str | None:
-    """Sinxron versiya — 403 va format xatoliklarini hal qiladi"""
+    """Sinxron versiya — 403 va bot check xatoliklarini hal qiladi"""
     safe = re.sub(r'[\\/*?:"<>|]', "_", filename)
     ffmpeg_cmd = find_ffmpeg_cmd()
     cookie_path = get_cookiefile()
 
-    def _try_download(prefix: str, extra_opts: dict, use_cookies: bool = True) -> str | None:
+    def _try_download(prefix: str, extra_opts: dict, use_cookies: bool = True, proxy_url: str = None) -> str | None:
         output_path = os.path.join(tempfile.gettempdir(), f"{prefix}_{safe}.%(ext)s")
 
-        # ASOSIY sozlamalar - formatni moslashuvchan qilamiz
         opts = {
-            # 'bestaudio/best' o'rniga - avval audio, keyin video+audio, keyin istalgan format
             'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best',
             'outtmpl': output_path,
             'postprocessors': [{
@@ -314,25 +347,30 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
-            'ignoreerrors': True,  # Xatoliklarni e'tiborsiz qoldirish
+            'ignoreerrors': True,
             'socket_timeout': 30,
             'retries': 3,
             'sleep_requests': 2,
             'sleep_interval': 1,
-            # PO Token bilan muammolarni oldini olish
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['mweb'],  # mweb eng ishonchli
+                    'player_client': ['mweb'],
                     'formats': 'missing_pot',
                 }
             },
         }
         if ffmpeg_cmd:
             opts['ffmpeg_location'] = os.path.dirname(ffmpeg_cmd)
-        # MUHIM: Cookies faqat so'rovda aytilsa qo'shiladi
-        # GitHub issue #15330: cookies format tanlashni buzishi mumkin
+        
+        # PROXY qo'shish
+        if proxy_url:
+            opts['proxy'] = proxy_url
+            logging.info(f"[Proxy] YouTube proxy ishlatilmoqda")
+        
+        # Cookies faqat so'ralganda qo'shiladi
         if use_cookies and cookie_path:
             opts['cookiefile'] = cookie_path
+
         opts.update(extra_opts)
 
         try:
@@ -341,25 +379,23 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
                 if not info:
                     return None
 
-                # Agar postprocessor ishlamasa, original faylni qaytarish
                 downloaded = ydl.prepare_filename(info)
                 mp3_path = downloaded.rsplit(".", 1)[0] + ".mp3"
 
-                # ===== MUHIM FIX: Yuklangan fayl haqiqatan audio ekanligini tekshirish =====
+                # Fayl haqiqatan audio ekanligini tekshirish
                 check_path = mp3_path if os.path.exists(mp3_path) else downloaded
                 if os.path.exists(check_path):
                     with open(check_path, 'rb') as f_check:
                         header = f_check.read(100)
 
-                    # Agar fayl HTML bo'lsa (bot check page), uni o'chirish
+                    # Agar fayl HTML bo'lsa (bot check page)
                     if header.startswith(b'<!DOCTYPE') or header.startswith(b'<html') or b'<HTML' in header[:50]:
-                        logging.warning(f"[Audio] Yuklangan fayl HTML sahifa (bot check). Cookies eskirgan bo'lishi mumkin.")
+                        logging.warning(f"[Audio] Yuklangan fayl HTML sahifa (bot check). Cookies eskirgan.")
                         os.remove(check_path)
-                        return "__EXPIRED_COOKIES__"  # Maxsus marker
+                        return "__EXPIRED_COOKIES__"
 
-                    # Agar fayl juda kichik bo'lsa (< 1KB), xato
                     if os.path.getsize(check_path) < 1024:
-                        logging.warning(f"[Audio] Fayl juda kichik, ehtimol xato sahifa")
+                        logging.warning(f"[Audio] Fayl juda kichik")
                         os.remove(check_path)
                         return None
 
@@ -368,58 +404,38 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
                 if os.path.exists(downloaded):
                     return downloaded
 
-            # Faylni topish (fallback)
-            base = os.path.join(tempfile.gettempdir(), f"{prefix}_{safe}")
-            for ext in ['.mp3', '.m4a', '.webm', '.opus', '.mp4']:
-                p = base + ext
-                if os.path.exists(p) and os.path.getsize(p) > 1024:
-                    # HTML emasligini tekshirish
-                    with open(p, 'rb') as f_check:
-                        h = f_check.read(50)
-                    if not (h.startswith(b'<!DOCTYPE') or h.startswith(b'<html') or b'<HTML' in h[:50]):
-                        return p
-                    else:
-                        os.remove(p)  # HTML faylni o'chirish
-
-            # Fallback: eng yangi faylni qidirish
-            files = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(f"{prefix}_{safe}")]
-            valid_files = []
-            for f in files:
-                p = os.path.join(tempfile.gettempdir(), f)
-                if os.path.getsize(p) > 1024:
-                    with open(p, 'rb') as f_check:
-                        h = f_check.read(50)
-                    if not (h.startswith(b'<!DOCTYPE') or h.startswith(b'<html') or b'<HTML' in h[:50]):
-                        valid_files.append(f)
-                    else:
-                        os.remove(p)
-
-            if valid_files:
-                return os.path.join(tempfile.gettempdir(), sorted(
-                    valid_files,
-                    key=lambda x: os.path.getmtime(os.path.join(tempfile.gettempdir(), x)),
-                    reverse=True
-                )[0])
+                # Fallback
+                base = os.path.join(tempfile.gettempdir(), f"{prefix}_{safe}")
+                for ext in ['.mp3', '.m4a', '.webm', '.opus', '.mp4']:
+                    p = base + ext
+                    if os.path.exists(p) and os.path.getsize(p) > 1024:
+                        with open(p, 'rb') as f_check:
+                            h = f_check.read(50)
+                        if not (h.startswith(b'<!DOCTYPE') or h.startswith(b'<html') or b'<HTML' in h[:50]):
+                            return p
+                        else:
+                            os.remove(p)
 
             return None
         except Exception as e:
             err = str(e)
             if '403' in err:
                 logging.warning(f"Download attempt ({prefix}) blocked: 403 Forbidden")
-            elif 'format' in err.lower() and 'not available' in err.lower():
-                logging.warning(f"Download attempt ({prefix}) format not available: {e}")
+            elif 'bot' in err.lower() or 'sign in' in err.lower():
+                logging.warning(f"Download attempt ({prefix}) bot check: {e}")
             else:
                 logging.warning(f"Download attempt ({prefix}) failed: {e}")
         return None
 
-    # ===== UPDATED: Cookies eskirgan bo'lsa, keyingi urinishga o'tish =====
+    # ===== TUZATILGAN URINISH TARTIBI =====
+    
+    # 1-urinish: mweb client, COOKIES BILAN + PROXY
+    if YOUTUBE_PROXY:
+        result = _try_download("dl_proxy", {}, use_cookies=True, proxy_url=YOUTUBE_PROXY)
+        if result and result != "__EXPIRED_COOKIES__":
+            return result
 
-    # 1-urinish: mweb client, COOKIES SIZ (eng ishonchli)
-    result = _try_download("dl", {}, use_cookies=False)
-    if result and result != "__EXPIRED_COOKIES__":
-        return result
-
-    # 2-urinish: mweb client, cookies BILAN (agar login talab qilinsa)
+    # 2-urinish: mweb client, COOKIES BILAN (proxy siz)
     result = _try_download("dl_cook", {}, use_cookies=True)
     if result:
         if result == "__EXPIRED_COOKIES__":
@@ -427,7 +443,18 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
         else:
             return result
 
-    # 3-urinish: tv client (cookies bilan)
+    # 3-urinish: mweb client, COOKIES SIZ + PROXY
+    if YOUTUBE_PROXY:
+        result = _try_download("dl_nocook_proxy", {}, use_cookies=False, proxy_url=YOUTUBE_PROXY)
+        if result and result != "__EXPIRED_COOKIES__":
+            return result
+
+    # 4-urinish: mweb client, COOKIES SIZ
+    result = _try_download("dl", {}, use_cookies=False)
+    if result and result != "__EXPIRED_COOKIES__":
+        return result
+
+    # 5-urinish: tv client
     result = _try_download("dl_tv", {
         'extractor_args': {
             'youtube': {
@@ -435,14 +462,11 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
                 'formats': 'missing_pot',
             }
         },
-    }, use_cookies=True)
-    if result:
-        if result == "__EXPIRED_COOKIES__":
-            pass  # Keyingi urinishga o'tish
-        else:
-            return result
+    }, use_cookies=False)
+    if result and result != "__EXPIRED_COOKIES__":
+        return result
 
-    # 4-urinish: android_vr (PO Token talab qilmaydi)
+    # 6-urinish: android_vr
     result = _try_download("dl_vr", {
         'extractor_args': {
             'youtube': {
@@ -457,7 +481,7 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
     if result and result != "__EXPIRED_COOKIES__":
         return result
 
-    # 5-urinish: web_embedded (PO Token talab qilmaydi, faqat embeddable)
+    # 7-urinish: web_embedded
     result = _try_download("dl_emb", {
         'extractor_args': {
             'youtube': {
@@ -466,30 +490,6 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
             }
         },
     }, use_cookies=False)
-    if result and result != "__EXPIRED_COOKIES__":
-        return result
-
-    # 6-urinish: android (cookies bilan)
-    result = _try_download("dl_and", {
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android'],
-                'formats': 'missing_pot',
-            }
-        },
-    }, use_cookies=True)
-    if result and result != "__EXPIRED_COOKIES__":
-        return result
-
-    # 7-urinish: ios (cookies bilan)
-    result = _try_download("dl_ios", {
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['ios'],
-                'formats': 'missing_pot',
-            }
-        },
-    }, use_cookies=True)
     if result and result != "__EXPIRED_COOKIES__":
         return result
 
@@ -3798,7 +3798,7 @@ async def global_error_handler(event):
 # ========================== MAIN ==========================
 async def main():
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,  # INFO o'rniga WARNING
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
