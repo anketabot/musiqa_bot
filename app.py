@@ -66,26 +66,27 @@ BOT_USERNAME = "skachatinstavideo_bot"
 # ========================== PIPED / INVIDIOUS SERVERS ==========================
 PIPED_SERVERS = [
     "https://pipedapi.kavin.rocks",
-    "https://pipedapi.moomoo.me",
-    "https://pipedapi.adminforge.de",
-    "https://pipedapi.p.projectsegfault.com",
-    "https://pipedapi.privacydev.net",
-    "https://pipedapi.palveluntarjoaja.eu",
+    "https://pipedapi-libre.kavin.rocks",
     "https://pipedapi.leptons.xyz",
-    "https://piped-api.lunar.icu",
-    "https://pipedapi.r4fo.com",
-    "https://api-piped.mha.fi",
+    "https://piped-api.privacy.com.de",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.yt",
+    "https://pipedapi.drgns.space",
+    "https://pipedapi.owo.si",
+    "https://pipedapi.ducks.party",
+    "https://piped-api.codespace.cz",
+    "https://pipedapi.reallyaweso.me",
+    "https://api.piped.private.coffee",
+    "https://pipedapi.darkness.services",
 ]
 
 INVIDIOUS_SERVERS = [
-    "https://vid.puffyan.us",
-    "https://y.com.sb",
-    "https://iv.nboeck.de",
-    "https://invidious.perennialte.ch",
-    "https://invidious.privacydev.net",
-    "https://invidious.drgns.space",
-    "https://iv.datura.network",
     "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://inv.thepixora.com",
+    "https://yt.chocolatemoo53.com",
+    "https://invidious.tiekoetter.com",
+    "https://invidious.f5.si",
 ]
 
 # ========================== UNIFIED COOKIE HELPER ==========================
@@ -201,15 +202,26 @@ async def piped_download_audio(video_id: str, output_path: str) -> str | None:
     if not audio_url:
         return None
 
+    # Piped audio URL lari odatda GoogleVideo (googlevideo.com) dan keladi
+    # Ba'zi serverlar uchun Referer header kerak bo'lishi mumkin
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://piped.video/",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
-            async with session.get(audio_url) as resp:
+            async with session.get(audio_url, headers=headers) as resp:
                 if resp.status == 200:
                     with open(output_path, 'wb') as f:
                         async for chunk in resp.content.iter_chunked(8192):
                             f.write(chunk)
                     if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
                         return output_path
+                else:
+                    logging.warning(f"[Piped Download] HTTP {resp.status}: {audio_url[:100]}")
     except Exception as e:
         logging.warning(f"[Piped Download] Audio yuklashda xatolik: {e}")
     return None
@@ -278,15 +290,25 @@ async def invidious_download_audio(video_id: str, output_path: str) -> str | Non
     audio_url = await invidious_get_audio_url(video_id)
     if not audio_url:
         return None
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://invidious.io/",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
-            async with session.get(audio_url) as resp:
+            async with session.get(audio_url, headers=headers) as resp:
                 if resp.status == 200:
                     with open(output_path, 'wb') as f:
                         async for chunk in resp.content.iter_chunked(8192):
                             f.write(chunk)
                     if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
                         return output_path
+                else:
+                    logging.warning(f"[Invidious Download] HTTP {resp.status}: {audio_url[:100]}")
     except Exception as e:
         logging.warning(f"[Invidious Download] Audio yuklashda xatolik: {e}")
     return None
@@ -314,7 +336,63 @@ async def download_audio(video_id: str, output_path: str) -> str | None:
     # 2. Invidious API fallback
     logging.info("[Download] Piped ishlamadi, Invidious ga o'tish...")
     result = await invidious_download_audio(video_id, output_path)
+    if result:
+        return result
+    # 3. YouTube embeddan audio olish (oxirgi fallback)
+    logging.info("[Download] Invidious ham ishlamadi, YouTube embed ga o'tish...")
+    result = await _youtube_embed_audio(video_id, output_path)
     return result
+
+
+async def _youtube_embed_audio(video_id: str, output_path: str) -> str | None:
+    """YouTube embed sahifasidan audio URL olish (fallback)."""
+    try:
+        import urllib.request
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        embed_url = f"https://www.youtube.com/embed/{video_id}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        }
+        req = urllib.request.Request(embed_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+
+        # ytInitialPlayerResponse ni qidirish
+        import re
+        match = re.search(r'ytInitialPlayerResponse\\s*=\\s*(\\{.+?\\});', html, re.S)
+        if match:
+            import json
+            data = json.loads(match.group(1))
+            streaming = data.get('streamingData', {})
+
+            # Adaptive formats dan audio ni olish
+            adaptive = streaming.get('adaptiveFormats', [])
+            audio_formats = [f for f in adaptive if f.get('mimeType', '').startswith('audio/')]
+
+            if audio_formats:
+                # Eng yaxshi bitrate ni tanlash
+                best = max(audio_formats, key=lambda x: x.get('bitrate', 0))
+                audio_url = best.get('url')
+                if audio_url:
+                    req_audio = urllib.request.Request(audio_url, headers={
+                        'User-Agent': headers['User-Agent'],
+                        'Referer': 'https://www.youtube.com/',
+                        'Accept': '*/*',
+                    })
+                    with urllib.request.urlopen(req_audio, timeout=120, context=ctx) as resp:
+                        with open(output_path, 'wb') as f:
+                            f.write(resp.read())
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                        return output_path
+    except Exception as e:
+        logging.warning(f"[YouTube Embed] Audio yuklashda xatolik: {e}")
+    return None
 
 
 # ========================== HELPERS ==========================
