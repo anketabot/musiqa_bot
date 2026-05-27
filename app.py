@@ -2074,7 +2074,7 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
 
     # ==================== PROXY SOZLAMALARI ====================
     # Proxy ni yoqish/o'chirish - True/False
-    USE_PROXY = False
+    USE_PROXY = True
 
     # HTTP Proxy (agar kerak bo'lsa) - o'zingizning proxyingizni kiriting
     # Format: "http://user:pass@host:port" yoki "http://host:port"
