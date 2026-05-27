@@ -116,18 +116,19 @@ def build_query_from_filename(filename: str) -> str | None:
     return base_name if len(base_name) >= 3 else None
 
 
-# DNS muammolarini oldini olish uchun TCPConnector
-connector = aiohttp.TCPConnector(
-    limit=100,
-    ttl_dns_cache=300,
-    use_dns_cache=True,
-    family=socket.AF_INET,  # Faqat IPv4
-)
+async def get_connector():
+    """Har safar yangi connector yaratadi"""
+    return aiohttp.TCPConnector(
+        limit=100,
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+        family=socket.AF_INET,
+    )
 
 async def search_piped_tracks(query: str, max_results: int = 15) -> list:
     for server in PIPED_SERVERS:
         try:
-            # Yangi connector bilan session
+            connector = await get_connector()  # Bu yerda event loop bor
             async with aiohttp.ClientSession(connector=connector) as session:
                 params = {"q": query, "filter": "music_songs"}
                 async with session.get(f"{server}/search", params=params, timeout=15) as resp:
