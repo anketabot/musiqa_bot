@@ -24,7 +24,7 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
     Message, CallbackQuery, ChatMemberUpdated,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile
+    FSInputFile, URLInputFile
 )
 from aiogram.filters import Command
 from aiogram.enums import ChatMemberStatus, ParseMode
@@ -59,6 +59,9 @@ DATABASE_URL = (
     "@turntable.proxy.rlwy.net:14314/railway"
 )
 
+# Proxy .env dan o'qiladi
+YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "")
+
 MAX_SIZE_MB = 50
 RESULTS_PER_PAGE = 10
 
@@ -68,18 +71,16 @@ SHARE_PROMO_CAPTION = (
 BOT_USERNAME = "skachatinstavideo_bot"
 
 # ========================== PIPED / INVIDIOUS SERVERS ==========================
+# Faqat ishonchli va hozirgi kunda ishlayotgan serverlar
 PIPED_SERVERS = [
-    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.adminforge.de",
     "https://pipedapi.moomoo.me",
+    "https://api.piped.projectsegfault.com",
 ]
 
 INVIDIOUS_SERVERS = [
     "https://iv.nboeck.de",
-    "https://invidious.perennialte.ch", 
-    "https://iv.datura.network",
-    "https://iv.melmac.space",
-    "https://yt.artemislena.eu",
-    "https://iv.nboeck.de",
+    "https://invidious.perennialte.ch",
     "https://vid.puffyan.us",
 ]
 
@@ -116,19 +117,213 @@ def build_query_from_filename(filename: str) -> str | None:
     return base_name if len(base_name) >= 3 else None
 
 
-async def get_connector():
-    """Har safar yangi connector yaratadi"""
-    return aiohttp.TCPConnector(
+# ========================== YOUTUBE ID EXTRACTOR ==========================
+def extract_youtube_id(url: str) -> str | None:
+    """YouTube URL dan video ID ajratish"""
+    patterns = [
+        r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/|youtube\.com/embed/)([A-Za-z0-9_-]{11})',
+        r'[?&]v=([A-Za-z0-9_-]{11})',
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+# ========================== DIRECT STREAM URL (ENG ISHONCHLI USUL) ==========================
+async def get_direct_audio_url(video_id: str) -> tuple[str | None, str | None]:
+    """
+    YouTube video ID dan to'g'ridan-to'g'ri audio stream URL olish.
+    Piped -> Invidious -> yt-dlp extract (android client + proxy).
+    Qaytaradi: (audio_url, thumbnail_url)
+    """
+    # 1. Piped
+    try:
+        streams = await get_piped_streams(video_id)
+        if streams:
+            audio_streams = streams.get("audioStreams", [])
+            if audio_streams:
+                best = max(audio_streams, key=lambda x: x.get("bitrate", 0))
+                url = best.get("url")
+                if url:
+                    thumb = streams.get("thumbnail", "")
+                    return url, thumb
+    except Exception as e:
+        logging.warning(f"Piped direct audio URL error: {e}")
+
+    # 2. Invidious
+    try:
+        streams = await get_invidious_streams(video_id)
+        if streams:
+            formats = streams.get("adaptiveFormats", []) or []
+            audio_formats = [f for f in formats if f.get("type", "").startswith("audio/")]
+            if not audio_formats:
+                formats = streams.get("formatStreams", []) or []
+                audio_formats = [f for f in formats if f.get("type", "").startswith("audio/")]
+            if audio_formats:
+                best = max(audio_formats, key=lambda x: x.get("bitrate", 0) or 0)
+                url = best.get("url")
+                if url:
+                    thumbs = streams.get("videoThumbnails", [])
+                    thumb = thumbs[0].get("url", "") if thumbs else ""
+                    return url, thumb
+    except Exception as e:
+        logging.warning(f"Invidious direct audio URL error: {e}")
+
+    # 3. yt-dlp - faqat URL ajratish, yuklamasdan (android client + proxy)
+    def _extract():
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": True,
+            "socket_timeout": 15,
+            "retries": 2,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android"],
+                    "player_skip": ["webpage", "configs", "js"]
+                }
+            },
+            "headers": {
+                "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        }
+        if YOUTUBE_PROXY:
+            opts["proxy"] = YOUTUBE_PROXY
+        
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if not info:
+                    return None, None
+                
+                direct_url = info.get("url")
+                thumb = info.get("thumbnail", "")
+                
+                if direct_url:
+                    return direct_url, thumb
+                
+                formats = info.get("formats", [])
+                audio_fmts = [
+                    f for f in formats 
+                    if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
+                ]
+                if audio_fmts:
+                    best = max(audio_fmts, key=lambda x: x.get("abr", 0) or x.get("tbr", 0) or 0)
+                    return best.get("url"), thumb
+                
+                for f in formats:
+                    if f.get("acodec") not in (None, "none"):
+                        return f.get("url"), thumb
+        except Exception as e:
+            logging.warning(f"yt-dlp audio extract error: {e}")
+        return None, None
+
+    try:
+        return await asyncio.to_thread(_extract)
+    except Exception as e:
+        logging.warning(f"Direct audio URL thread error: {e}")
+        return None, None
+
+
+async def get_direct_video_url(video_id: str) -> tuple[str | None, str | None]:
+    """YouTube video ID dan to'g'ridan-to'g'ri video stream URL olish."""
+    # 1. Piped
+    try:
+        streams = await get_piped_streams(video_id)
+        if streams:
+            video_streams = streams.get("videoStreams", [])
+            if video_streams:
+                mp4_streams = [s for s in video_streams if s.get("format") == "MPEG_4" or "mp4" in s.get("url", "")]
+                if mp4_streams:
+                    best = max(mp4_streams, key=lambda x: x.get("quality", 0))
+                else:
+                    best = max(video_streams, key=lambda x: x.get("quality", 0))
+                url = best.get("url")
+                if url:
+                    return url, streams.get("thumbnail", "")
+    except Exception as e:
+        logging.warning(f"Piped direct video URL error: {e}")
+
+    # 2. Invidious
+    try:
+        streams = await get_invidious_streams(video_id)
+        if streams:
+            formats = streams.get("formatStreams", []) or streams.get("adaptiveFormats", [])
+            video_formats = [f for f in formats if f.get("type", "").startswith("video/")]
+            if video_formats:
+                best = max(video_formats, key=lambda x: x.get("bitrate", 0) or 0)
+                url = best.get("url")
+                if url:
+                    thumbs = streams.get("videoThumbnails", [])
+                    thumb = thumbs[0].get("url", "") if thumbs else ""
+                    return url, thumb
+    except Exception as e:
+        logging.warning(f"Invidious direct video URL error: {e}")
+
+    # 3. yt-dlp extract
+    def _extract():
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        opts = {
+            "format": "best[ext=mp4]/best",
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": True,
+            "socket_timeout": 15,
+            "retries": 2,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android"],
+                }
+            },
+            "headers": {
+                "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
+            },
+        }
+        if YOUTUBE_PROXY:
+            opts["proxy"] = YOUTUBE_PROXY
+        
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info and info.get("url"):
+                    return info["url"], info.get("thumbnail", "")
+                formats = info.get("formats", []) if info else []
+                mp4_fmts = [f for f in formats if f.get("ext") == "mp4"]
+                if mp4_fmts:
+                    best = max(mp4_fmts, key=lambda x: x.get("height", 0) or 0)
+                    return best.get("url"), info.get("thumbnail", "") if info else ""
+                for f in formats:
+                    if f.get("vcodec") not in (None, "none"):
+                        return f.get("url"), info.get("thumbnail", "") if info else ""
+        except Exception as e:
+            logging.warning(f"yt-dlp video extract error: {e}")
+        return None, None
+
+    try:
+        return await asyncio.to_thread(_extract)
+    except Exception as e:
+        logging.warning(f"Direct video URL thread error: {e}")
+        return None, None
+
+
+# ========================== PIPED / INVIDIOUS API ==========================
+async def search_piped_tracks(query: str, max_results: int = 15) -> list:
+    # Connector funksiya ichida yaratiladi (global emas)
+    connector = aiohttp.TCPConnector(
         limit=100,
         ttl_dns_cache=300,
         use_dns_cache=True,
         family=socket.AF_INET,
     )
-
-async def search_piped_tracks(query: str, max_results: int = 15) -> list:
     for server in PIPED_SERVERS:
         try:
-            connector = await get_connector()  # Bu yerda event loop bor
             async with aiohttp.ClientSession(connector=connector) as session:
                 params = {"q": query, "filter": "music_songs"}
                 async with session.get(f"{server}/search", params=params, timeout=15) as resp:
@@ -230,17 +425,13 @@ async def download_piped_audio(video_id: str, output_dir: str, filename_base: st
     if not audio_streams:
         return None
     
-    # Eng yaxshi audio stream (bitrate bo'yicha)
     best = max(audio_streams, key=lambda x: x.get("bitrate", 0))
     audio_url = best.get("url")
-    mime = best.get("mimeType", "")
     
-    # Vaqtinchalik fayl
     tmp_path = os.path.join(output_dir, f"{filename_base}_tmp.m4a")
     output_path = os.path.join(output_dir, f"{filename_base}.mp3")
     
     try:
-        # 1. Yuklash
         async with aiohttp.ClientSession() as session:
             async with session.get(audio_url, timeout=120) as resp:
                 if resp.status != 200:
@@ -252,20 +443,18 @@ async def download_piped_audio(video_id: str, output_dir: str, filename_base: st
         if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1024:
             return None
         
-        # 2. FFmpeg orqali to'g'ri MP3 ga konvertatsiya
         ffmpeg_cmd = find_ffmpeg_cmd()
         if ffmpeg_cmd:
             proc = await asyncio.create_subprocess_exec(
                 ffmpeg_cmd, "-y", "-i", tmp_path,
                 "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
-                "-f", "mp3",  # Force MP3 format
+                "-f", "mp3",
                 output_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
             _, stderr = await proc.communicate()
-            
-            _cleanup_file(tmp_path)  # Vaqtinchalik faylni o'chirish
+            _cleanup_file(tmp_path)
             
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
                 return output_path
@@ -273,8 +462,6 @@ async def download_piped_audio(video_id: str, output_dir: str, filename_base: st
                 logging.error(f"FFmpeg konvertatsiya xatosi: {stderr.decode() if stderr else 'Noma\'lum'}")
                 return None
         else:
-            # FFmpeg yo'q bo'lsa, vaqtinchalik faylni qaytarish
-            # (lekin bu Telegram'da muammo bo'lishi mumkin)
             logging.warning("FFmpeg topilmadi, konvertatsiya qilinmaydi")
             return tmp_path
             
@@ -290,24 +477,20 @@ async def download_invidious_audio(video_id: str, output_dir: str, filename_base
     if not streams:
         return None
     
-    # Adaptive formats'dan audio olish
     formats = streams.get("adaptiveFormats", [])
     audio_formats = [f for f in formats if f.get("type", "").startswith("audio/")]
     
     if not audio_formats:
-        # formatStreams'dan urinish
         formats = streams.get("formatStreams", [])
         audio_formats = [f for f in formats if f.get("type", "").startswith("audio/")]
     
     if not audio_formats:
         return None
     
-    # Eng yaxshi bitrate
     best = max(audio_formats, key=lambda x: x.get("bitrate", 0) or 0)
     audio_url = best.get("url")
     mime = best.get("type", "")
     
-    # Kengaytmani aniqlash
     if "mp4" in mime:
         ext = "m4a"
     elif "webm" in mime:
@@ -319,7 +502,6 @@ async def download_invidious_audio(video_id: str, output_dir: str, filename_base
     output_path = os.path.join(output_dir, f"{filename_base}.mp3")
     
     try:
-        # Yuklash
         async with aiohttp.ClientSession() as session:
             async with session.get(audio_url, timeout=120) as resp:
                 if resp.status != 200:
@@ -331,7 +513,6 @@ async def download_invidious_audio(video_id: str, output_dir: str, filename_base
         if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1024:
             return None
         
-        # FFmpeg konvertatsiya
         ffmpeg_cmd = find_ffmpeg_cmd()
         if ffmpeg_cmd:
             proc = await asyncio.create_subprocess_exec(
@@ -343,7 +524,6 @@ async def download_invidious_audio(video_id: str, output_dir: str, filename_base
                 stderr=asyncio.subprocess.PIPE,
             )
             _, stderr = await proc.communicate()
-            
             _cleanup_file(tmp_path)
             
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
@@ -370,12 +550,10 @@ async def download_piped_video(video_id: str, output_path: str) -> str | None:
                         continue
                     data = await resp.json()
                     
-                    # Video streamlar
                     video_streams = data.get("videoStreams", [])
                     if not video_streams:
                         continue
                     
-                    # MP4 formatni tanlash
                     mp4_streams = [s for s in video_streams 
                                    if s.get("format") == "MPEG_4" 
                                    or "mp4" in s.get("url", "")]
@@ -383,14 +561,12 @@ async def download_piped_video(video_id: str, output_path: str) -> str | None:
                     if mp4_streams:
                         best = max(mp4_streams, key=lambda x: x.get("quality", 0))
                     else:
-                        # Boshqa format
                         best = max(video_streams, key=lambda x: x.get("quality", 0))
                     
                     video_url = best.get("url")
                     if not video_url:
                         continue
                     
-                    # Vaqtinchalik yuklash
                     tmp_path = output_path + ".tmp"
                     async with session.get(video_url, timeout=120) as dl_resp:
                         if dl_resp.status != 200:
@@ -399,13 +575,12 @@ async def download_piped_video(video_id: str, output_path: str) -> str | None:
                             async for chunk in dl_resp.content.iter_chunked(8192):
                                 f.write(chunk)
                     
-                    # FFmpeg orqali to'g'ri MP4 ga o'tkazish
                     ffmpeg_cmd = find_ffmpeg_cmd()
                     if ffmpeg_cmd and not output_path.endswith('.mp4'):
                         output_path = output_path.rsplit('.', 1)[0] + '.mp4'
                         proc = await asyncio.create_subprocess_exec(
                             ffmpeg_cmd, "-y", "-i", tmp_path,
-                            "-c", "copy",  # Stream copy (tez)
+                            "-c", "copy",
                             "-f", "mp4",
                             output_path,
                             stdout=asyncio.subprocess.DEVNULL,
@@ -536,11 +711,18 @@ async def search_yt_dlp_fallback(query: str, max_results: int = 15) -> list:
             "socket_timeout": 10,
             "retries": 2,
             "ignoreerrors": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android"],
+                }
+            },
             "headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept-Language": "en-US,en;q=0.9",
             },
         }
+        if YOUTUBE_PROXY:
+            opts["proxy"] = YOUTUBE_PROXY
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -572,17 +754,14 @@ async def search_yt_dlp_fallback(query: str, max_results: int = 15) -> list:
 
 async def search_youtube_tracks(query: str, max_results: int = 15) -> list:
     """Avval Piped/Invidious, keyin yt-dlp fallback."""
-    # 1. Piped
     results = await search_piped_tracks(query, max_results)
     if results:
         return results
     
-    # 2. Invidious fallback
     results = await search_invidious_tracks(query, max_results)
     if results:
         return results
     
-    # 3. yt-dlp fallback (so'ngi variant)
     logging.warning("Piped/Invidious ishlamadi, yt-dlp fallback...")
     return await search_yt_dlp_fallback(query, max_results)
 
@@ -590,7 +769,6 @@ async def download_yt_dlp_audio(video_id: str, output_dir: str, filename_base: s
     """yt-dlp orqali audio yuklash (so'ngi fallback)."""
     def _download():
         url = f"https://www.youtube.com/watch?v={video_id}"
-        # yt-dlp outtmpl formati
         output_template = os.path.join(output_dir, f"{filename_base}.%(ext)s")
         
         opts = {
@@ -602,6 +780,11 @@ async def download_yt_dlp_audio(video_id: str, output_dir: str, filename_base: s
             "ignoreerrors": True,
             "socket_timeout": 30,
             "retries": 3,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android"],
+                }
+            },
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
@@ -612,6 +795,8 @@ async def download_yt_dlp_audio(video_id: str, output_dir: str, filename_base: s
                 "Accept-Language": "en-US,en;q=0.9",
             },
         }
+        if YOUTUBE_PROXY:
+            opts["proxy"] = YOUTUBE_PROXY
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -619,27 +804,22 @@ async def download_yt_dlp_audio(video_id: str, output_dir: str, filename_base: s
                 if not info:
                     return None
 
-                # Postprocessor MP3 qilgan fayl
-                # outtmpl: filename_base.mp3 (postprocessor avtomatik almashtiradi)
                 mp3_path = os.path.join(output_dir, f"{filename_base}.mp3")
                 
                 if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 1024:
                     return mp3_path
                 
-                # Agar postprocessor ishlamasa, boshqa formatlarni qidirish
                 base = os.path.join(output_dir, filename_base)
                 for ext in [".mp3", ".m4a", ".webm", ".opus", ".ogg"]:
                     p = base + ext
                     if os.path.exists(p) and os.path.getsize(p) > 1024:
                         return p
                 
-                # Eng yangi faylni qidirish
                 files = [f for f in os.listdir(output_dir) if f.startswith(filename_base)]
                 valid_files = []
                 for f in files:
                     p = os.path.join(output_dir, f)
                     if os.path.getsize(p) > 1024:
-                        # HTML emasligini tekshirish
                         with open(p, 'rb') as f_check:
                             h = f_check.read(50)
                         if not (h.startswith(b'<!DOCTYPE') or h.startswith(b'<html')):
@@ -669,7 +849,6 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
         import urllib.request
         import ssl
 
-        # Post ID ajratib olish
         post_id = None
         patterns = [
             r'instagram\.com/(?:p|reel|tv|share)/([^/?#]+)',
@@ -693,7 +872,6 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        # ========== USUL 1: Embed sahifa ==========
         try:
             embed_url = f"https://www.instagram.com/p/{post_id}/embed/captioned/"
             headers = {
@@ -714,7 +892,6 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
             title = None
             thumbnail_url = None
 
-            # 1. JSON-LD dan olish
             ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html, flags=re.S)
             if ld_json:
                 try:
@@ -732,7 +909,6 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                 except Exception as e:
                     logging.warning(f"[Instagram] JSON-LD parse xatolik: {e}")
 
-            # 2. og:video dan olish
             if not media_url:
                 og_video = re.search(r'<meta[^>]+property="og:video"[^>]+content="(https://[^"]+)"', html)
                 if og_video:
@@ -740,14 +916,12 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                     is_video = True
                     logging.info(f"[Instagram] og:video topildi: {media_url[:80]}...")
 
-            # 3. og:video:secure_url
             if not media_url:
                 og_video_secure = re.search(r'<meta[^>]+property="og:video:secure_url"[^>]+content="(https://[^"]+)"', html)
                 if og_video_secure:
                     media_url = og_video_secure.group(1)
                     is_video = True
 
-            # 4. video tag
             if not media_url:
                 video_matches = re.findall(r'<video[^>]+(?:src|data-src)="(https://[^"]+)"', html)
                 if video_matches:
@@ -755,7 +929,6 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                     is_video = True
                     logging.info(f"[Instagram] video tag dan topildi: {media_url[:80]}...")
 
-            # 5. JS orqali video URL
             if not media_url:
                 video_url_patterns = [
                     r'"video_url":"(https://[^"]+\.mp4[^"]*)"',
@@ -770,14 +943,12 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                         logging.info(f"[Instagram] JS video URL topildi: {media_url[:80]}...")
                         break
 
-            # 6. Thumbnail (agar video topilmasa)
             if not media_url and not thumbnail_url:
                 og_match = re.search(r'<meta[^>]+property="og:image"[^>]+content="(https://[^"]+scontent[^"]+)"', html)
                 if og_match:
                     thumbnail_url = og_match.group(1)
                     logging.info(f"[Instagram] og:image topildi (thumbnail): {thumbnail_url[:80]}...")
 
-            # ========== VIDEO YUKLASH ==========
             if media_url and is_video:
                 media_url = media_url.replace('\u0026', '&').replace('&amp;', '&')
                 output_path = os.path.join(tempfile.gettempdir(), f"ig_embed_{post_id}.mp4")
@@ -817,7 +988,6 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                     else:
                         return output_path, {"title": title or f"Instagram {post_id}", "is_video": True}
 
-            # ========== RASM YUKLASH ==========
             if thumbnail_url and not media_url:
                 thumbnail_url = thumbnail_url.replace('\u0026', '&').replace('&amp;', '&')
                 output_path = os.path.join(tempfile.gettempdir(), f"ig_embed_{post_id}.jpg")
@@ -837,7 +1007,6 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
         except Exception as e:
             logging.warning(f"[Instagram] Embed usuli xatolik: {e}")
 
-        # ========== USUL 2: Post sahifasi ==========
         try:
             post_url = f"https://www.instagram.com/p/{post_id}/"
             headers = {
@@ -2212,7 +2381,7 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
     Boshqalar: yt-dlp.
     """
 
-    # YouTube: Piped orqali
+    # YouTube: Piped orqali (faqat non-YouTube direct URL ishlatilmaganda chaqiriladi)
     youtube_id = None
     if "youtube.com" in url or "youtu.be" in url:
         if "youtu.be/" in url:
@@ -2225,7 +2394,6 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
             result = await download_piped_video(youtube_id, output_path)
             if result:
                 return result, {"title": f"YouTube {youtube_id}"}
-            # Invidious fallback
             output_path2 = os.path.join(tempfile.gettempdir(), f"yt_invidious_{youtube_id}.mp4")
             result = await download_invidious_video(youtube_id, output_path2)
             if result:
@@ -2248,6 +2416,9 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
             ydl_opts['headers'] = {'Referer': 'https://www.tiktok.com/'}
         elif "pinterest" in url.lower():
             ydl_opts['format'] = 'best[ext=mp4]/bestvideo+bestaudio/best/bestimage/best'
+        
+        if YOUTUBE_PROXY and ("youtube" in url.lower() or "youtu.be" in url.lower()):
+            ydl_opts['proxy'] = YOUTUBE_PROXY
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -2272,7 +2443,6 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
     
     result = await asyncio.to_thread(_download)
     
-    # Pinterest fallback
     if "pinterest" in url.lower() and (result is None or result[0] is None):
         fallback_result = await download_pinterest_fallback(url)
         if fallback_result and fallback_result[0]:
@@ -2567,7 +2737,6 @@ async def build_search_page(user_id: int, page: int):
     if row:
         kb.append(row)
 
-    # Navigatsiya tugmalari
     nav_row = []
     if page > 0:
         nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"page:{user_id}:{page - 1}"))
@@ -2641,49 +2810,52 @@ async def select_music(call: CallbackQuery):
     url = item.get("url") or ""
     video_id = item.get("id", "")
     
-    # Video ID ni aniqlash
     if not video_id and url:
-        match = re.search(r'[?&]v=([^&]+)', url)
-        if match:
-            video_id = match.group(1)
-        elif "/watch/" in url:
-            video_id = url.split("/watch/")[-1].split("?")[0]
-        else:
-            video_id = url.strip("/").split("/")[-1]
+        video_id = extract_youtube_id(url)
 
     lang = await get_lang(user_id)
-
     await call.answer()
 
     if not video_id:
         await call.message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
         return
 
-    # Audio yuklash — 3 ta usul bilan fallback
+    # ========== ENG ISHONCHLI USUL: Direct URL orqali yuborish ==========
+    audio_url, thumb_url = await get_direct_audio_url(video_id)
+    
+    if audio_url:
+        try:
+            await call.message.answer_audio(
+                audio=URLInputFile(url=audio_url),
+                title=title,
+                performer=uploader,
+                thumbnail=URLInputFile(url=thumb_url) if thumb_url else None,
+                caption=SHARE_PROMO_CAPTION,
+                reply_markup=build_share_kb(),
+            )
+            logging.info(f"[Audio] Direct URL orqali yuborildi: {video_id}")
+            return
+        except Exception as e:
+            logging.warning(f"[Audio] Direct URL yuborishda xato: {e}. Fallback...")
+    
+    # ========== FALLBACK: Serverga yuklab, keyin yuborish ==========
     safe_name = re.sub(r'[\\/*?:"<>|]', "_", f"{uploader} - {title}")
     temp_dir = tempfile.gettempdir()
     
-    # 1. Piped orqali audio yuklash
-    logging.info(f"[Audio] Piped orqali yuklanmoqda: {video_id}")
+    logging.info(f"[Audio] Serverga yuklab olish boshlandi: {video_id}")
     audio_path = await download_piped_audio(video_id, temp_dir, f"piped_{safe_name}")
     
-    # 2. Piped ishlamasa → Invidious
     if not audio_path or not os.path.exists(audio_path):
-        logging.info(f"[Audio] Invidious orqali yuklanmoqda: {video_id}")
         audio_path = await download_invidious_audio(video_id, temp_dir, f"invidious_{safe_name}")
     
-    # 3. Invidious ham ishlamasa → yt-dlp fallback
     if not audio_path or not os.path.exists(audio_path):
-        logging.warning(f"[Audio] Piped/Invidious ishlamadi, yt-dlp fallback: {video_id}")
         audio_path = await download_yt_dlp_audio(video_id, temp_dir, f"ytdlp_{safe_name}")
     
-    # Hamma usul ishlamasa
     if not audio_path or not os.path.exists(audio_path):
         logging.error(f"[Audio] Barcha usullar ishlamadi: {video_id}")
         await call.message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
         return
 
-    # Fayl hajmi tekshirish
     size_mb = os.path.getsize(audio_path) / (1024 * 1024)
     if size_mb > MAX_SIZE_MB:
         await call.message.answer(
@@ -2692,7 +2864,6 @@ async def select_music(call: CallbackQuery):
         _cleanup_file(audio_path)
         return
 
-    # Audio yuborish
     try:
         await call.message.answer_audio(
             audio=FSInputFile(audio_path),
@@ -2729,61 +2900,83 @@ async def dl_music_callback(call: CallbackQuery):
     lang = await get_lang(user_id)
     path = state.get("path")
     metadata_title = state.get("title")
+    youtube_id = state.get("youtube_id")
 
     await call.answer()
 
-    try:
-        # Shazam orqali aniqlash
+    # Agar faqat title/ID bo'lsa (YouTube direct URL dan)
+    if not path or not os.path.exists(path):
         query = None
-        if path and os.path.exists(path):
-            try:
-                recognize_path = path
-                if path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv')):
-                    recognize_path = await extract_audio_ffmpeg(path)
-
-                shazam_result = await recognize_with_shazam(recognize_path)
-
-                if recognize_path != path:
-                    _cleanup_file(recognize_path)
-
-                if shazam_result:
-                    title = shazam_result.get("title", "")
-                    artist = shazam_result.get("artist", "")
-                    query = f"{artist} {title}".strip()
-            except Exception as e:
-                logging.warning(f"Shazam xatolik: {e}")
-
-        if not query and metadata_title:
+        if metadata_title:
             query = normalize_search_query(metadata_title)
-        if not query and path:
-            query = build_query_from_filename(path)
-
+        elif youtube_id:
+            query = youtube_id
+        
         if not query:
             await call.message.answer(TEXTS[lang]["not_recognized"])
             return
-
-        # Piped/Invidious qidirish
+        
         results = await search_youtube_tracks(query, max_results=15)
-
         if not results:
             await call.message.answer(TEXTS[lang]["music_not_found_group"], reply_markup=build_share_kb())
             return
-
-        # Natijalarni saqlash
+        
         user_search_state[user_id] = {
             "results": results,
             "page": 0,
             "query": query,
             "source": "youtube",
         }
-
         text, markup = await build_search_page(user_id, 0)
         if text:
             await call.message.answer(text, reply_markup=markup)
+        return
 
-    except Exception as e:
-        logging.error(f"dl_music error: {e}")
-        await call.message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+    # Local fayl bor - Shazam orqali
+    query = None
+    if path and os.path.exists(path):
+        try:
+            recognize_path = path
+            if path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv')):
+                recognize_path = await extract_audio_ffmpeg(path)
+
+            shazam_result = await recognize_with_shazam(recognize_path)
+
+            if recognize_path != path:
+                _cleanup_file(recognize_path)
+
+            if shazam_result:
+                title = shazam_result.get("title", "")
+                artist = shazam_result.get("artist", "")
+                query = f"{artist} {title}".strip()
+        except Exception as e:
+            logging.warning(f"Shazam xatolik: {e}")
+
+    if not query and metadata_title:
+        query = normalize_search_query(metadata_title)
+    if not query and path:
+        query = build_query_from_filename(path)
+
+    if not query:
+        await call.message.answer(TEXTS[lang]["not_recognized"])
+        return
+
+    results = await search_youtube_tracks(query, max_results=15)
+
+    if not results:
+        await call.message.answer(TEXTS[lang]["music_not_found_group"], reply_markup=build_share_kb())
+        return
+
+    user_search_state[user_id] = {
+        "results": results,
+        "page": 0,
+        "query": query,
+        "source": "youtube",
+    }
+
+    text, markup = await build_search_page(user_id, 0)
+    if text:
+        await call.message.answer(text, reply_markup=markup)
 
 
 @router.callback_query(F.data.startswith("find_music:"))
@@ -2801,39 +2994,63 @@ async def find_music_callback(call: CallbackQuery):
     state = link_download_state.pop(user_id, None)
     path = state.get("path") if isinstance(state, dict) else None
     metadata_title = state.get("title") if isinstance(state, dict) else None
+    youtube_id = state.get("youtube_id") if isinstance(state, dict) else None
+    
+    await call.answer()
+    lang = await get_lang(user_id)
+
+    # Agar local fayl yo'q bo'lsa, faqat titledan qidirish
     if not path or not os.path.exists(path):
-        await call.answer("❌ Fayl topilmadi. Qayta yuklang.", show_alert=True)
+        query = None
+        if metadata_title:
+            query = normalize_search_query(metadata_title)
+        elif youtube_id:
+            query = youtube_id
+        
+        if not query:
+            await call.message.answer(TEXTS[lang]["not_recognized"])
+            return
+        
+        try:
+            youtube_results = await search_youtube_tracks(query, max_results=15)
+            if youtube_results:
+                user_search_state[user_id] = {
+                    "results": youtube_results,
+                    "page": 0,
+                    "query": query,
+                    "source": "youtube",
+                }
+                text, markup = await build_search_page(user_id, 0)
+                if text:
+                    await call.message.answer(text, reply_markup=markup)
+            else:
+                await call.message.answer(TEXTS[lang]["music_not_found_group"], reply_markup=build_share_kb())
+        except Exception as e:
+            logging.error(f"Title-only qidiruvda xatolik: {e}")
+            await call.message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
         return
 
-    await call.answer()
-
-    lang = await get_lang(user_id)
+    # Local fayl bor - Shazam logic
     tmp_path = None
     recognize_path = None
     shazam_result = None
 
     try:
         tmp_path = path
-        ext = path.split(".")[-1] if "." in path else "mp4"
-
-        # Video bo'lsa audio ajratish
         if tmp_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv')):
             recognize_path = await extract_audio_ffmpeg(tmp_path)
         else:
             recognize_path = tmp_path
 
-        # Shazam orqali aniqlash
         shazam_result = await recognize_with_shazam(recognize_path)
 
     except Exception as e:
         logging.warning(f"Shazam aniqlashda xatolik: {e}")
         shazam_result = None
     finally:
-        # Vaqtinchalik fayllarni tozalash
         if recognize_path and recognize_path != tmp_path and recognize_path != path:
             _cleanup_file(recognize_path)
 
-    # Shazam topgan bo'lsa, uning natijalari bilan qidirish
     if shazam_result:
         title = shazam_result.get("title", "Noma'lum")
         artist = shazam_result.get("artist", "Noma'lum")
@@ -2850,7 +3067,6 @@ async def find_music_callback(call: CallbackQuery):
             _cleanup_file(path)
             return
 
-    # Piped/Invidious orqali qidirish
     try:
         youtube_results = await search_youtube_tracks(query, max_results=15)
 
@@ -3042,6 +3258,29 @@ async def text_handler(message: Message):
         try:
             url_text = message.text.strip()
             
+            # ===== YOUTUBE: Direct URL usuli (eng tez va ishonchli) =====
+            youtube_id = extract_youtube_id(url_text)
+            if youtube_id and ("youtube.com" in url_text or "youtu.be" in url_text):
+                video_url, video_meta = await get_direct_video_url(youtube_id)
+                if video_url:
+                    try:
+                        link_download_state[message.from_user.id] = {
+                            "path": None,
+                            "title": video_meta.get("title") if video_meta else f"YouTube {youtube_id}",
+                            "youtube_id": youtube_id,
+                        }
+                        kb = build_video_kb(message.from_user.id, lang)
+                        await message.answer_video(
+                            video=URLInputFile(url=video_url),
+                            caption=SHARE_PROMO_CAPTION,
+                            reply_markup=kb,
+                        )
+                        logging.info(f"[YouTube Link] Direct URL orqali video yuborildi: {youtube_id}")
+                        return
+                    except Exception as e:
+                        logging.warning(f"[YouTube Link] Direct URL xato: {e}. Fallback...")
+                # Agar direct URL ishlamasa, eski usulga o'tadi
+            
             if re.search(r'https?://(?:www\.)?threads\.com/', url_text, flags=re.I):
                 url_text = re.sub(r'^(https?://)(?:www\.)?threads\.com/', r"\1www.threads.net/", url_text, flags=re.I)
             
@@ -3206,7 +3445,6 @@ async def text_handler(message: Message):
 
     msg = await message.answer(TEXTS[lang]["searching"])
 
-    # Piped qidiruv
     results = await search_youtube_tracks(query, max_results=20)
 
     if not results:
@@ -3293,7 +3531,6 @@ async def process_audio_recognition(bot: Bot, file_id: str | None, user_id: int,
 
         result = await recognize_with_shazam(recognize_path)
 
-        # Cleanup
         if tmp_path and tmp_path != local_path:
             _cleanup_file(tmp_path)
         if recognize_path and recognize_path != tmp_path and recognize_path != local_path:
@@ -3307,7 +3544,6 @@ async def process_audio_recognition(bot: Bot, file_id: str | None, user_id: int,
         artist = result.get("artist", "Noma'lum")
         query = f"{artist} {title}".strip()
 
-        # Piped/Invidious orqali qidirish
         youtube_results = await search_youtube_tracks(query, max_results=15)
 
         await loading_msg.delete()
@@ -3324,7 +3560,6 @@ async def process_audio_recognition(bot: Bot, file_id: str | None, user_id: int,
                 await message.answer(text, reply_markup=markup)
             return
 
-        # Topilmasa
         if lang == "uz":
             text = f"🎵 <b>{artist}</b> — <b>{title}</b>\n\n❌ YouTube'da topilmadi.\n🎵 Qo'shiq nomini yozib qidiring."
         elif lang == "uz_kr":
