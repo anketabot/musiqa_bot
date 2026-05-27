@@ -213,7 +213,7 @@ async def get_invidious_streams(video_id: str) -> dict | None:
 
 
 async def download_piped_audio(video_id: str, output_dir: str, filename_base: str) -> str | None:
-    """Piped dan eng yaxshi audio stream ni yuklab olish."""
+    """Piped dan audio yuklab, to'g'ri formatga o'tkazish."""
     streams = await get_piped_streams(video_id)
     if not streams:
         return None
@@ -222,54 +222,84 @@ async def download_piped_audio(video_id: str, output_dir: str, filename_base: st
     if not audio_streams:
         return None
     
+    # Eng yaxshi audio stream (bitrate bo'yicha)
     best = max(audio_streams, key=lambda x: x.get("bitrate", 0))
     audio_url = best.get("url")
     mime = best.get("mimeType", "")
     
-    if "mp4" in mime or "m4a" in mime:
-        ext = "m4a"
-    elif "webm" in mime:
-        ext = "webm"
-    else:
-        ext = "m4a"
-    
-    output_path = os.path.join(output_dir, f"{filename_base}.{ext}")
+    # Vaqtinchalik fayl
+    tmp_path = os.path.join(output_dir, f"{filename_base}_tmp.m4a")
+    output_path = os.path.join(output_dir, f"{filename_base}.mp3")
     
     try:
+        # 1. Yuklash
         async with aiohttp.ClientSession() as session:
             async with session.get(audio_url, timeout=120) as resp:
-                if resp.status == 200:
-                    with open(output_path, 'wb') as f:
-                        async for chunk in resp.content.iter_chunked(8192):
-                            f.write(chunk)
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                        return output_path
+                if resp.status != 200:
+                    return None
+                with open(tmp_path, 'wb') as f:
+                    async for chunk in resp.content.iter_chunked(8192):
+                        f.write(chunk)
+        
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1024:
+            return None
+        
+        # 2. FFmpeg orqali to'g'ri MP3 ga konvertatsiya
+        ffmpeg_cmd = find_ffmpeg_cmd()
+        if ffmpeg_cmd:
+            proc = await asyncio.create_subprocess_exec(
+                ffmpeg_cmd, "-y", "-i", tmp_path,
+                "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
+                "-f", "mp3",  # Force MP3 format
+                output_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            
+            _cleanup_file(tmp_path)  # Vaqtinchalik faylni o'chirish
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                return output_path
+            else:
+                logging.error(f"FFmpeg konvertatsiya xatosi: {stderr.decode() if stderr else 'Noma\'lum'}")
+                return None
+        else:
+            # FFmpeg yo'q bo'lsa, vaqtinchalik faylni qaytarish
+            # (lekin bu Telegram'da muammo bo'lishi mumkin)
+            logging.warning("FFmpeg topilmadi, konvertatsiya qilinmaydi")
+            return tmp_path
+            
     except Exception as e:
         logging.error(f"Piped audio yuklash xatosi: {e}")
-    
-    # Fallback Invidious
-    return await download_invidious_audio(video_id, output_dir, filename_base)
+        _cleanup_file(tmp_path)
+        return None
 
 
 async def download_invidious_audio(video_id: str, output_dir: str, filename_base: str) -> str | None:
-    """Invidious dan audio yuklash (fallback)."""
+    """Invidious dan audio yuklab, to'g'ri formatga o'tkazish."""
     streams = await get_invidious_streams(video_id)
     if not streams:
         return None
     
+    # Adaptive formats'dan audio olish
     formats = streams.get("adaptiveFormats", [])
     audio_formats = [f for f in formats if f.get("type", "").startswith("audio/")]
+    
     if not audio_formats:
+        # formatStreams'dan urinish
         formats = streams.get("formatStreams", [])
         audio_formats = [f for f in formats if f.get("type", "").startswith("audio/")]
     
     if not audio_formats:
         return None
     
+    # Eng yaxshi bitrate
     best = max(audio_formats, key=lambda x: x.get("bitrate", 0) or 0)
     audio_url = best.get("url")
     mime = best.get("type", "")
     
+    # Kengaytmani aniqlash
     if "mp4" in mime:
         ext = "m4a"
     elif "webm" in mime:
@@ -277,20 +307,49 @@ async def download_invidious_audio(video_id: str, output_dir: str, filename_base
     else:
         ext = "m4a"
     
-    output_path = os.path.join(output_dir, f"{filename_base}.{ext}")
+    tmp_path = os.path.join(output_dir, f"{filename_base}_tmp.{ext}")
+    output_path = os.path.join(output_dir, f"{filename_base}.mp3")
     
     try:
+        # Yuklash
         async with aiohttp.ClientSession() as session:
             async with session.get(audio_url, timeout=120) as resp:
-                if resp.status == 200:
-                    with open(output_path, 'wb') as f:
-                        async for chunk in resp.content.iter_chunked(8192):
-                            f.write(chunk)
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                        return output_path
+                if resp.status != 200:
+                    return None
+                with open(tmp_path, 'wb') as f:
+                    async for chunk in resp.content.iter_chunked(8192):
+                        f.write(chunk)
+        
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1024:
+            return None
+        
+        # FFmpeg konvertatsiya
+        ffmpeg_cmd = find_ffmpeg_cmd()
+        if ffmpeg_cmd:
+            proc = await asyncio.create_subprocess_exec(
+                ffmpeg_cmd, "-y", "-i", tmp_path,
+                "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
+                "-f", "mp3",
+                output_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            
+            _cleanup_file(tmp_path)
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                return output_path
+            else:
+                logging.error(f"FFmpeg xatosi: {stderr.decode() if stderr else 'Noma\'lum'}")
+                return None
+        else:
+            return tmp_path
+            
     except Exception as e:
         logging.error(f"Invidious audio yuklash xatosi: {e}")
-    return None
+        _cleanup_file(tmp_path)
+        return None
 
 
 async def download_piped_video(video_id: str, output_path: str) -> str | None:
