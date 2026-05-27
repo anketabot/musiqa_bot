@@ -1,5 +1,3104 @@
-aiogram>=3.0.0
-aiohttp>=3.8.0
-asyncpg>=0.29.0
-shazamio>=0.4.0
-python-dotenv>=1.0.0
+import os
+import sys
+import warnings
+import re
+import asyncio
+import logging
+import tempfile
+import shutil
+import hashlib
+import base64
+import html
+from datetime import datetime
+from typing import Any
+import dotenv
+from dotenv import load_dotenv
+load_dotenv()
+import aiohttp
+import asyncpg
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import (
+    Message, CallbackQuery, ChatMemberUpdated,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    FSInputFile
+)
+from aiogram.filters import Command
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.exceptions import TelegramAPIError, TelegramConflictError, TelegramNetworkError
+from aiogram.client.default import DefaultBotProperties
+
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*ffmpeg.*")
+
+try:
+    from shazamio import Shazam
+except ImportError:
+    Shazam = None
+
+
+def can_use_shazam() -> bool:
+    if Shazam is None:
+        return False
+    try:
+        import audioop  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+shazam_client = Shazam() if can_use_shazam() else None
+
+# ========================== CONFIG ==========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8860093565:AAEYUKIC_dNOPeKSeoksM0L9YE9QzFu1mrE")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "7961099561"))
+DATABASE_URL = (
+    "postgresql://postgres:NWthCzkTirkhOLywbKwWlwXrnOfiqjSO"
+    "@turntable.proxy.rlwy.net:14314/railway"
+)
+
+MAX_SIZE_MB = 50
+RESULTS_PER_PAGE = 10
+
+SHARE_PROMO_CAPTION = (
+    "❤️ @skachatinstavideo_bot orqali istagan musiqangizni tez va oson toping! 🚀"
+)
+BOT_USERNAME = "skachatinstavideo_bot"
+
+# ========================== PIPED / INVIDIOUS SERVERS ==========================
+PIPED_SERVERS = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.moomoo.me",
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.p.projectsegfault.com",
+    "https://pipedapi.privacydev.net",
+    "https://pipedapi.palveluntarjoaja.eu",
+    "https://pipedapi.leptons.xyz",
+    "https://piped-api.lunar.icu",
+    "https://pipedapi.r4fo.com",
+    "https://api-piped.mha.fi",
+]
+
+INVIDIOUS_SERVERS = [
+    "https://vid.puffyan.us",
+    "https://y.com.sb",
+    "https://iv.nboeck.de",
+    "https://invidious.perennialte.ch",
+    "https://invidious.privacydev.net",
+    "https://invidious.drgns.space",
+    "https://iv.datura.network",
+    "https://inv.nadeko.net",
+]
+
+# ========================== UNIFIED COOKIE HELPER ==========================
+COOKIE_FILE = os.path.join(os.getcwd(), "cookies.txt")
+
+
+def get_cookiefile() -> str | None:
+    """Agar cookies.txt mavjud bo'lsa, yo'lini qaytaradi, aks holda None."""
+    if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 100:
+        try:
+            with open(COOKIE_FILE, 'r', encoding='utf-8') as f:
+                cookie_content = f.read()
+
+            has_youtube = '.youtube.com' in cookie_content
+            has_youtube_login = 'LOGIN_INFO' in cookie_content or 'SID' in cookie_content
+            has_instagram = '.instagram.com' in cookie_content
+            has_instagram_session = 'sessionid' in cookie_content.lower()
+
+            if has_instagram and not has_youtube and not has_instagram_session:
+                return None
+            if has_youtube and not has_youtube_login:
+                return None
+            return COOKIE_FILE
+        except Exception:
+            return COOKIE_FILE
+    return None
+
+
+def normalize_search_query(query: str) -> str:
+    """Musiqa qidiruv so'rovini tozalash."""
+    query = query or ""
+    query = re.sub(r'[_\-\.+]+', ' ', query)
+    query = re.sub(
+        r'\b(?:mp4|webm|mkv|mov|m4v|jpg|jpeg|png|webp|video|audio|download|instagram|insta|reel|tv|post)\b',
+        ' ',
+        query,
+        flags=re.I,
+    )
+    query = re.sub(r'\d+', ' ', query)
+    query = re.sub(r'\s+', ' ', query).strip()
+    return query
+
+
+def build_query_from_filename(filename: str) -> str | None:
+    base_name = os.path.splitext(os.path.basename(filename))[0]
+    base_name = re.sub(r'^(?:ig_embed_|ig_api_|dl_nocook_|dl_|yt_|audio_|video_|\d+_)+', '', base_name, flags=re.I)
+    base_name = normalize_search_query(base_name)
+    return base_name if len(base_name) >= 3 else None
+
+
+# ========================== PIPED API HELPERS ==========================
+async def piped_search(query: str, max_results: int = 15) -> list:
+    """Piped API orqali YouTube'dan musiqa qidirish."""
+    results = []
+    for server in PIPED_SERVERS:
+        try:
+            url = f"{server}/search"
+            params = {"q": query, "filter": "music_songs"}
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, list):
+                            for item in data[:max_results]:
+                                if item.get("url", "").startswith("/watch?v="):
+                                    video_id = item["url"].replace("/watch?v=", "")
+                                    results.append({
+                                        "id": video_id,
+                                        "title": item.get("title", "Noma'lum"),
+                                        "uploader": item.get("uploader", "—"),
+                                        "duration": item.get("duration", 0),
+                                        "url": f"https://www.youtube.com/watch?v={video_id}",
+                                        "thumbnail": item.get("thumbnail", ""),
+                                    })
+                            if results:
+                                return results
+        except Exception as e:
+            logging.warning(f"[Piped] {server} xatolik: {e}")
+            continue
+    return results
+
+
+async def piped_get_streams(video_id: str) -> dict | None:
+    """Piped API orqali video stream ma'lumotlarini olish."""
+    for server in PIPED_SERVERS:
+        try:
+            url = f"{server}/streams/{video_id}"
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data and "audioStreams" in data:
+                            return data
+        except Exception as e:
+            logging.warning(f"[Piped Streams] {server} xatolik: {e}")
+            continue
+    return None
+
+
+async def piped_download_audio(video_id: str, output_path: str) -> str | None:
+    """Piped API orqali audio stream URL ni olib, yuklab olish."""
+    stream_data = await piped_get_streams(video_id)
+    if not stream_data:
+        return None
+
+    audio_streams = stream_data.get("audioStreams", [])
+    if not audio_streams:
+        return None
+
+    # Eng yaxshi audio stream ni tanlash (bitrate bo'yicha)
+    best_audio = max(audio_streams, key=lambda x: x.get("bitrate", 0))
+    audio_url = best_audio.get("url")
+    if not audio_url:
+        return None
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+            async with session.get(audio_url) as resp:
+                if resp.status == 200:
+                    with open(output_path, 'wb') as f:
+                        async for chunk in resp.content.iter_chunked(8192):
+                            f.write(chunk)
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                        return output_path
+    except Exception as e:
+        logging.warning(f"[Piped Download] Audio yuklashda xatolik: {e}")
+    return None
+
+
+# ========================== INVIDIOUS API HELPERS (FALLBACK) ==========================
+async def invidious_search(query: str, max_results: int = 15) -> list:
+    """Invidious API orqali YouTube'dan musiqa qidirish (fallback)."""
+    results = []
+    for server in INVIDIOUS_SERVERS:
+        try:
+            url = f"{server}/api/v1/search"
+            params = {"q": query, "type": "video"}
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, list):
+                            for item in data[:max_results]:
+                                if item.get("type") == "video":
+                                    video_id = item.get("videoId", "")
+                                    if video_id:
+                                        results.append({
+                                            "id": video_id,
+                                            "title": item.get("title", "Noma'lum"),
+                                            "uploader": item.get("author", "—"),
+                                            "duration": item.get("lengthSeconds", 0),
+                                            "url": f"https://www.youtube.com/watch?v={video_id}",
+                                            "thumbnail": item.get("videoThumbnails", [{}])[0].get("url", "") if item.get("videoThumbnails") else "",
+                                        })
+                            if results:
+                                return results
+        except Exception as e:
+            logging.warning(f"[Invidious] {server} xatolik: {e}")
+            continue
+    return results
+
+
+async def invidious_get_audio_url(video_id: str) -> str | None:
+    """Invidious API orqali audio stream URL olish."""
+    for server in INVIDIOUS_SERVERS:
+        try:
+            url = f"{server}/api/v1/videos/{video_id}"
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        adaptive = data.get("adaptiveFormats", [])
+                        audio_formats = [f for f in adaptive if f.get("type", "").startswith("audio/")]
+                        if audio_formats:
+                            best = max(audio_formats, key=lambda x: x.get("bitrate", 0))
+                            return best.get("url")
+                        # formatStreams dan audio qidirish
+                        formats = data.get("formatStreams", [])
+                        for f in formats:
+                            if f.get("type", "").startswith("audio/"):
+                                return f.get("url")
+        except Exception as e:
+            logging.warning(f"[Invidious Streams] {server} xatolik: {e}")
+            continue
+    return None
+
+
+async def invidious_download_audio(video_id: str, output_path: str) -> str | None:
+    """Invidious API orqali audio yuklash."""
+    audio_url = await invidious_get_audio_url(video_id)
+    if not audio_url:
+        return None
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+            async with session.get(audio_url) as resp:
+                if resp.status == 200:
+                    with open(output_path, 'wb') as f:
+                        async for chunk in resp.content.iter_chunked(8192):
+                            f.write(chunk)
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                        return output_path
+    except Exception as e:
+        logging.warning(f"[Invidious Download] Audio yuklashda xatolik: {e}")
+    return None
+
+
+# ========================== UNIFIED SEARCH & DOWNLOAD ==========================
+async def search_music(query: str, max_results: int = 15) -> list:
+    """Piped -> Invidious fallback orqali musiqa qidirish."""
+    # 1. Piped API
+    results = await piped_search(query, max_results)
+    if results:
+        return results
+    # 2. Invidious API fallback
+    logging.info("[Search] Piped ishlamadi, Invidious ga o'tish...")
+    results = await invidious_search(query, max_results)
+    return results
+
+
+async def download_audio(video_id: str, output_path: str) -> str | None:
+    """Piped -> Invidious fallback orqali audio yuklash."""
+    # 1. Piped API
+    result = await piped_download_audio(video_id, output_path)
+    if result:
+        return result
+    # 2. Invidious API fallback
+    logging.info("[Download] Piped ishlamadi, Invidious ga o'tish...")
+    result = await invidious_download_audio(video_id, output_path)
+    return result
+
+
+# ========================== HELPERS ==========================
+def build_share_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="👥 Guruhga qo'shish",
+                url=f"https://t.me/{BOT_USERNAME}?startgroup=true"
+            ),
+        ]
+    ])
+
+
+def build_video_kb(user_id: int, lang: str) -> InlineKeyboardMarkup:
+    if lang == "uz_kr":
+        dl_text = "🎵 Қўшиқни юклаб олиш"
+    elif lang == "ru":
+        dl_text = "🎵 Скачать музыку"
+    else:
+        dl_text = "🎵 Qo'shiqni yuklab olish"
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=dl_text,
+                callback_data=f"dl_music:{user_id}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="👥 Guruhga qo'shish",
+                url=f"https://t.me/{BOT_USERNAME}?startgroup=true"
+            ),
+        ]
+    ])
+
+
+def format_duration(seconds) -> str:
+    if not seconds:
+        return "?"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def find_ffmpeg_cmd() -> str | None:
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths()
+    except ImportError:
+        pass
+    return shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+
+
+async def check_subscriptions(bot: Bot, user_id: int, channels: list) -> bool:
+    if not channels:
+        return True
+    for ch in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=f"@{ch['username']}", user_id=user_id)
+            if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+# ========================== INSTAGRAM DOWNLOADERS (SAQLANDI) ==========================
+async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any] | None]:
+    def _download():
+        import urllib.request
+        import ssl
+        import json
+
+        post_id = None
+        patterns = [
+            r'instagram\.com/(?:p|reel|tv|share)/([^/?#]+)',
+            r'instagram\.com/reel/([^/?#]+)',
+            r'instagram\.com/p/([^/?#]+)',
+            r'instagram\.com/tv/([^/?#]+)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                post_id = match.group(1)
+                break
+
+        if not post_id:
+            return None, None
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        # Embed sahifa
+        try:
+            embed_url = f"https://www.instagram.com/p/{post_id}/embed/captioned/"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://www.instagram.com/',
+            }
+            req = urllib.request.Request(embed_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=20, context=ctx) as response:
+                html_text = response.read().decode('utf-8')
+
+            media_url = None
+            is_video = False
+            title = None
+            thumbnail_url = None
+
+            ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html_text, flags=re.S)
+            if ld_json:
+                try:
+                    ld_data = json.loads(ld_json.group(1))
+                    if isinstance(ld_data, dict):
+                        if 'video' in ld_data and isinstance(ld_data['video'], dict):
+                            media_url = ld_data['video'].get('contentUrl')
+                            is_video = True
+                        elif 'image' in ld_data and isinstance(ld_data['image'], str):
+                            thumbnail_url = ld_data['image']
+                        if 'caption' in ld_data:
+                            title = ld_data['caption']
+                except Exception:
+                    pass
+
+            if not media_url:
+                og_video = re.search(r'<meta[^>]+property="og:video"[^>]+content="(https://[^"]+)"', html_text)
+                if og_video:
+                    media_url = og_video.group(1)
+                    is_video = True
+
+            if not media_url:
+                og_video_secure = re.search(r'<meta[^>]+property="og:video:secure_url"[^>]+content="(https://[^"]+)"', html_text)
+                if og_video_secure:
+                    media_url = og_video_secure.group(1)
+                    is_video = True
+
+            if not media_url:
+                video_matches = re.findall(r'<video[^>]+(?:src|data-src)="(https://[^"]+)"', html_text)
+                if video_matches:
+                    media_url = video_matches[0]
+                    is_video = True
+
+            if not media_url:
+                video_url_patterns = [
+                    r'"video_url":"(https://[^"]+\.mp4[^"]*)"',
+                    r'"video_url":"([^"]+)"',
+                    r'src="(https://[^"]+instagram\.com[^"]+\.mp4[^"]*)"',
+                ]
+                for pattern in video_url_patterns:
+                    match = re.search(pattern, html_text)
+                    if match:
+                        media_url = match.group(1).replace('\\u0026', '&')
+                        is_video = True
+                        break
+
+            if not media_url and not thumbnail_url:
+                og_match = re.search(r'<meta[^>]+property="og:image"[^>]+content="(https://[^"]+scontent[^"]+)"', html_text)
+                if og_match:
+                    thumbnail_url = og_match.group(1)
+
+            if media_url and is_video:
+                media_url = media_url.replace('\\u0026', '&').replace('&amp;', '&')
+                output_path = os.path.join(tempfile.gettempdir(), f"ig_embed_{post_id}.mp4")
+                req_media = urllib.request.Request(media_url, headers={
+                    'User-Agent': headers['User-Agent'],
+                    'Referer': 'https://www.instagram.com/',
+                    'Accept': '*/*',
+                })
+                with urllib.request.urlopen(req_media, timeout=30, context=ctx) as response:
+                    with open(output_path, 'wb') as f:
+                        f.write(response.read())
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                    with open(output_path, 'rb') as f_check:
+                        header = f_check.read(12)
+                    is_image = header.startswith(b'\xff\xd8\xff') or header.startswith(b'\x89PNG')
+                    if is_image:
+                        new_path = output_path.rsplit('.', 1)[0] + '.jpg'
+                        os.rename(output_path, new_path)
+                        return new_path, {"title": title or f"Instagram {post_id}", "is_video": False}
+                    is_real_video = (header.startswith(b'\x00\x00\x00') and b'ftyp' in header[:20]) or b'ftypmp42' in header[:20]
+                    if not is_real_video and os.path.getsize(output_path) < 1024 * 1024:
+                        os.remove(output_path)
+                        media_url = None
+                    else:
+                        return output_path, {"title": title or f"Instagram {post_id}", "is_video": True}
+
+            if thumbnail_url and not media_url:
+                thumbnail_url = thumbnail_url.replace('\\u0026', '&').replace('&amp;', '&')
+                output_path = os.path.join(tempfile.gettempdir(), f"ig_embed_{post_id}.jpg")
+                req_img = urllib.request.Request(thumbnail_url, headers={
+                    'User-Agent': headers['User-Agent'],
+                    'Referer': 'https://www.instagram.com/',
+                })
+                with urllib.request.urlopen(req_img, timeout=30, context=ctx) as response:
+                    with open(output_path, 'wb') as f:
+                        f.write(response.read())
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                    return output_path, {"title": title or f"Instagram {post_id}", "is_video": False}
+        except Exception as e:
+            logging.warning(f"[Instagram] Embed usuli xatolik: {e}")
+
+        # Post sahifasi
+        try:
+            post_url = f"https://www.instagram.com/p/{post_id}/"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://www.instagram.com/',
+            }
+            req = urllib.request.Request(post_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=20, context=ctx) as response:
+                html_text = response.read().decode('utf-8', errors='ignore')
+
+            media_url = None
+            is_video = False
+            ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html_text, flags=re.S)
+            if ld_json:
+                try:
+                    ld_data = json.loads(ld_json.group(1))
+                    if isinstance(ld_data, dict):
+                        if 'video' in ld_data and isinstance(ld_data['video'], dict):
+                            media_url = ld_data['video'].get('contentUrl') or ld_data['video'].get('thumbnailUrl')
+                            is_video = True
+                        elif 'image' in ld_data and isinstance(ld_data['image'], str):
+                            media_url = ld_data['image']
+                except Exception:
+                    pass
+
+            if not media_url:
+                og_match = re.search(r'<meta[^>]+property="og:image"[^>]+content="(https://[^"]+scontent[^"]+)"', html_text)
+                if og_match:
+                    media_url = og_match.group(1)
+
+            if not media_url:
+                og_video = re.search(r'<meta[^>]+property="og:video"[^>]+content="(https://[^"]+)"', html_text)
+                if og_video:
+                    media_url = og_video.group(1)
+                    is_video = True
+
+            if media_url:
+                media_url = media_url.replace('\\u0026', '&').replace('&amp;', '&')
+                ext = '.mp4' if is_video else '.jpg'
+                output_path = os.path.join(tempfile.gettempdir(), f"ig_post_{post_id}{ext}")
+                req_media = urllib.request.Request(media_url, headers=headers)
+                with urllib.request.urlopen(req_media, timeout=30, context=ctx) as response:
+                    with open(output_path, 'wb') as f:
+                        f.write(response.read())
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                    return output_path, {"title": f"Instagram {post_id}", "is_video": is_video}
+        except Exception as e:
+            logging.warning(f"[Instagram] Post page xatolik: {e}")
+
+        return None, None
+    return await asyncio.to_thread(_download)
+
+
+async def download_instagram_embed(url: str) -> str | None:
+    def _download_embed():
+        import urllib.request
+        try:
+            post_id = None
+            patterns = [
+                r'instagram\.com/(?:p|reel|tv)/([^/?]+)',
+                r'instagram\.com/reel/([^/?]+)',
+                r'instagram\.com/p/([^/?]+)',
+                r'instagram\.com/tv/([^/?]+)',
+                r'instagram\.com/share/([^/?]+)',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, url)
+                if match:
+                    post_id = match.group(1)
+                    break
+            if not post_id:
+                return None
+
+            embed_url = f"https://www.instagram.com/p/{post_id}/embed/"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://www.instagram.com/',
+            }
+            req = urllib.request.Request(embed_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as response:
+                html_text = response.read().decode('utf-8')
+
+            video_patterns = [
+                r'"video_url":"([^"]+)"',
+                r'"videoUrl":"([^"]+)"',
+                r'<video[^>]+src="([^"]+)"',
+                r'property="og:video" content="([^"]+)"',
+                r'property="og:video:secure_url" content="([^"]+)"',
+            ]
+            video_url = None
+            for pattern in video_patterns:
+                match = re.search(pattern, html_text)
+                if match:
+                    video_url = match.group(1).replace('\\u0026', '&')
+                    break
+
+            if video_url:
+                output_path = os.path.join(tempfile.gettempdir(), f"ig_embed_{post_id}.mp4")
+                req_video = urllib.request.Request(video_url, headers=headers)
+                with urllib.request.urlopen(req_video, timeout=30) as response:
+                    with open(output_path, 'wb') as f:
+                        f.write(response.read())
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                    return output_path
+
+            image_patterns = [
+                r'"display_url":"([^"]+)"',
+                r'property="og:image" content="([^"]+)"',
+                r'<img[^>]+src="([^"]+)"[^>]*class="[^"]*EmbeddedMediaImage',
+                r'<img[^>]+src="([^"]+)"[^>]*data-testid="[^"]*photo',
+                r'"thumbnail_src":"([^"]+)"',
+                r'"media_preview":"([^"]+)"',
+                r'data-src="([^"]+)"',
+            ]
+            image_url = None
+            for pattern in image_patterns:
+                match = re.search(pattern, html_text)
+                if match:
+                    image_url = match.group(1).replace('\\u0026', '&')
+                    break
+
+            if image_url:
+                output_path = os.path.join(tempfile.gettempdir(), f"ig_embed_{post_id}.jpg")
+                req_img = urllib.request.Request(image_url, headers=headers)
+                with urllib.request.urlopen(req_img, timeout=30) as response:
+                    with open(output_path, 'wb') as f:
+                        f.write(response.read())
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                    return output_path
+            return None
+        except Exception as e:
+            logging.warning(f"Instagram embed yuklashda xatolik: {e}")
+            return None
+    return await asyncio.to_thread(_download_embed)
+
+
+async def download_instagram_api(url: str) -> str | None:
+    def _download_api():
+        import urllib.request
+        import json
+        try:
+            post_id = None
+            patterns = [
+                r'instagram\.com/(?:p|reel|tv)/([^/?]+)',
+                r'instagram\.com/reel/([^/?]+)',
+                r'instagram\.com/p/([^/?]+)',
+                r'instagram\.com/tv/([^/?]+)',
+                r'instagram\.com/share/([^/?]+)',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, url)
+                if match:
+                    post_id = match.group(1)
+                    break
+            if not post_id:
+                return None
+
+            oembed_url = f"https://graph.facebook.com/v18.0/instagram_oembed?url=https://www.instagram.com/p/{post_id}/&access_token=APP_ID|APP_SECRET"
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            req = urllib.request.Request(oembed_url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode('utf-8'))
+                    thumbnail_url = data.get('thumbnail_url')
+                    if thumbnail_url:
+                        output_path = os.path.join(tempfile.gettempdir(), f"ig_api_{post_id}.jpg")
+                        req_img = urllib.request.Request(thumbnail_url, headers=headers)
+                        with urllib.request.urlopen(req_img, timeout=30) as response:
+                            with open(output_path, 'wb') as f:
+                                f.write(response.read())
+                        if os.path.exists(output_path):
+                            return output_path
+            except Exception:
+                pass
+            return None
+        except Exception as e:
+            logging.warning(f"Instagram API yuklashda xatolik: {e}")
+            return None
+    result = await asyncio.to_thread(_download_api)
+    if result:
+        return result
+    return await download_instagram_post_page(url)
+
+
+async def download_instagram_post_page(url: str) -> str | None:
+    def _download_post():
+        import urllib.request
+        import ssl
+        import json
+        from urllib.parse import urlparse
+        try:
+            post_id = None
+            patterns = [
+                r'instagram\.com/(?:p|reel|tv)/([^/?]+)',
+                r'instagram\.com/reel/([^/?]+)',
+                r'instagram\.com/p/([^/?]+)',
+                r'instagram\.com/tv/([^/?]+)',
+                r'instagram\.com/share/([^/?]+)',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, url)
+                if match:
+                    post_id = match.group(1)
+                    break
+            if not post_id:
+                return None
+
+            post_url = f"https://www.instagram.com/p/{post_id}/"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://www.instagram.com/',
+            }
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            req = urllib.request.Request(post_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=20, context=ctx) as response:
+                html_text = response.read().decode('utf-8', errors='ignore')
+
+            json_text = None
+            shared_data = re.search(r'window\._sharedData\s*=\s*(\{.*?\});</script>', html_text, flags=re.S)
+            if shared_data:
+                json_text = shared_data.group(1)
+            else:
+                additional = re.search(r'window\.__additionalDataLoaded\([^,]+,\s*(\{.*?\})\);', html_text, flags=re.S)
+                if additional:
+                    json_text = additional.group(1)
+                else:
+                    ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html_text, flags=re.S)
+                    if ld_json:
+                        json_text = ld_json.group(1)
+
+            data = None
+            if json_text:
+                try:
+                    data = json.loads(json_text)
+                except Exception:
+                    cleaned = re.sub(r'\s+', ' ', json_text)
+                    try:
+                        data = json.loads(cleaned)
+                    except Exception:
+                        data = None
+
+            media_url = None
+            is_video = False
+            if isinstance(data, dict):
+                node = data
+                if 'graphql' in node and isinstance(node['graphql'], dict):
+                    node = node['graphql'].get('shortcode_media', node)
+                elif 'shortcode_media' in node:
+                    node = node['shortcode_media']
+                elif '@graph' in node and isinstance(node['@graph'], list) and node['@graph']:
+                    node = node['@graph'][0]
+
+                if isinstance(node, dict):
+                    if node.get('is_video'):
+                        is_video = True
+                        media_url = node.get('video_url') or node.get('videoUrl') or node.get('display_url')
+                    else:
+                        media_url = node.get('display_url') or node.get('thumbnail_src') or node.get('thumbnailUrl')
+                        if not media_url and isinstance(node.get('edge_sidecar_to_children'), dict):
+                            for edge in node['edge_sidecar_to_children'].get('edges', []):
+                                child = edge.get('node', {})
+                                if child.get('display_url'):
+                                    media_url = child['display_url']
+                                    break
+
+            if not media_url:
+                video_match = re.search(r'property="og:video" content="([^"]+)"', html_text)
+                if video_match:
+                    media_url = video_match.group(1)
+                    is_video = True
+                else:
+                    image_match = re.search(r'property="og:image" content="([^"]+)"', html_text)
+                    if image_match:
+                        media_url = image_match.group(1)
+
+            if not media_url:
+                ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html_text, flags=re.S)
+                if ld_json:
+                    try:
+                        ld_data = json.loads(ld_json.group(1))
+                        if isinstance(ld_data, dict):
+                            if 'video' in ld_data and 'contentUrl' in ld_data['video']:
+                                media_url = ld_data['video']['contentUrl']
+                                is_video = True
+                            elif 'image' in ld_data and isinstance(ld_data['image'], str):
+                                media_url = ld_data['image']
+                            elif 'thumbnailUrl' in ld_data:
+                                media_url = ld_data['thumbnailUrl']
+                    except Exception:
+                        pass
+
+            if not media_url:
+                img_matches = re.findall(r'src="(https://[^"]+instagram\.com[^"]+\.(?:jpg|jpeg|png|webp))"', html_text)
+                if img_matches:
+                    media_url = img_matches[0]
+
+            if not media_url:
+                return None
+
+            media_url = media_url.replace('\\u0026', '&')
+            ext = os.path.splitext(urlparse(media_url).path)[1].split('?')[0].lower()
+            if ext not in ('.mp4', '.jpg', '.jpeg', '.png', '.webp', '.gif'):
+                ext = '.mp4' if is_video else '.jpg'
+
+            output_path = os.path.join(tempfile.gettempdir(), f"ig_post_{post_id}{ext}")
+            req_media = urllib.request.Request(media_url, headers=headers)
+            with urllib.request.urlopen(req_media, timeout=30, context=ctx) as response:
+                with open(output_path, 'wb') as f:
+                    f.write(response.read())
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                return output_path
+            return None
+        except Exception as e:
+            logging.warning(f"Instagram post page yuklashda xatolik: {e}")
+            return None
+    return await asyncio.to_thread(_download_post)
+
+
+# ========================== I18N TEXTS ==========================
+TEXTS = {
+    "uz": {
+        "choose_lang": "🌐 Tilni tanlang:",
+        "welcome": (
+            "✨ @skachatinstavideo_bot ga xush kelibsiz!\n\n"
+            "🎵 Nom, ijrochi, matn yoki link orqali qidiruv.\n"
+            "🎙 Ovozli xabar va video orqali musiqani aniqlash.\n"
+            "📎 Instagram, YouTube va boshqa ijtimoiy tarmoqlardan media yuboring.\n\n"
+            "🔗 Link, 🎙 Voice yoki 📝 Matn yuboring!"
+        ),
+        "force_sub": "❌ <b>Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:</b>",
+        "check_sub": "✅ A'zolikni tekshirish",
+        "not_subscribed": "❌ Siz hali barcha kanallarga a'zo bo'lmagansiz!",
+        "sub_ok_group": "✅ A'zolik tasdiqlandi! Endi musiqa qidirishingiz mumkin.",
+        "searching": "🔍 Qidirilmoqda...",
+        "search_results": "🔎 <b>Topilgan musiqalar:</b>\n\n",
+        "no_results": "❌ Hech narsa topilmadi.",
+        "music_selected": "🎵 {artist} - {title}\n\n🔎 Yuklanmoqda...",
+        "recognizing": "🔎 Aniqlanmoqda...",
+        "not_recognized": "❌ Musiqa aniqlanmadi. Iltimos, sifatli audio yuboring.",
+        "downloading": "🔎 Yuklanmoqda...",
+        "download_done": "✅ Yuklandi!",
+        "download_error": (
+            "Afsuski ushbu media faylni yuklay olmadim.\n\n"
+            "Media faylni yuklash uchun, botni guruhga qo'shing"
+        ),
+        "download_failed_group": (
+            "Afsuski ushbu media faylni yuklay olmadim.\n\n"
+            "Media faylni yuklash uchun, botni guruhga qo'shing"
+        ),
+        "music_not_found_group": (
+            "⚠️ Afsuski musiqa topilmadi\n\n"
+            "Musiqani topish uchun guruhga qo'shing👇"
+        ),
+        "file_too_large": (
+            "❌ Fayl hajmi juda katta ({size_mb} MB).\n"
+            "Telegram bot orqali maksimal yuborish hajmi: {limit_mb} MB.\n"
+            "Iltimos, kichikroq fayl yuboring yoki to'g'ridan-to'g'ri link orqali yuklab oling."
+        ),
+        "photo_downloaded": (
+            "📸 <b>Rasm qabul qilindi!</b>\n\n"
+            "❤️ @skachatinstavideo_bot"
+        ),
+        "video_downloaded": (
+            "🎬 <b>Video qabul qilindi!</b>\n\n"
+            "🎵 Musiqasini topish uchun tugmani bosing!"
+        ),
+        "extracting_music": "🎵 Musiqa aniqlanmoqda...",
+        "music_found_from_video": (
+            "🎵 <b>Musiqa topildi!</b>\n\n"
+            "🎤 Ijrochi: {artist}\n"
+            "🎼 Qo'shiq: {title}\n\n"
+            "🔎 Qidirilmoqda..."
+        ),
+        "admin_welcome": (
+            "🔧 <b>Admin Panel</b>\n\n"
+            "Kerakli bo'limni tanlang:"
+        ),
+        "stats": (
+            "📊 <b>Analitika</b>\n\n"
+            "👤 Jami foydalanuvchilar: <b>{total}</b>\n"
+            "⚡ Faol (24 soat): <b>{active}</b>\n"
+            "🆕 Yangi (7 kun): <b>{week}</b>\n"
+            "🌐 Tillar bo'yicha:\n{langs}\n\n"
+            "🔥 Top 10 qidiruvlar:\n{top}"
+        ),
+        "broadcast_ask_text": "📨 Broadcast matnini yuboring:",
+        "broadcast_ask_media": "📎 Broadcast uchun media yuboring (rasm, video, audio):",
+        "broadcast_ask_caption": (
+            "📎 Media qabul qilindi.\n\n"
+            "📝 Yozuv (caption) qo'shish uchun matn yuboring:\n"
+            "⏭️ O'tkazib yuborish uchun /skip deb yozing:"
+        ),
+        "broadcast_done": "✅ Xabar <b>{count}</b> ta foydalanuvchi va guruhga yuborildi.",
+        "blocked": "🚫 Siz botdan bloklangansiz.",
+        "blacklist_add": "🚫 Foydalanuvchi blocklandi.",
+        "blacklist_remove": "✅ Foydalanuvchi blockdan chiqarildi.",
+        "channel_add": "📢 Kanal qo'shildi.",
+        "channel_remove": "❌ Kanal o'chirildi.",
+        "profile": (
+            "👤 <b>Profil</b>\n\n"
+            "🆔 ID: <code>{telegram_id}</code>\n"
+            "👤 Ism: {fullname}\n"
+            "🔤 Username: {username}\n"
+            "🌐 Til: {language}"
+        ),
+        "help_text": (
+            "🎵 @skachatinstavideo_bot yordam\n\n"
+            "🔹 <b>Qo'shiq nomi</b> — <i>Eminem Mockingbird</i>\n"
+            "🔹 <b>Ijrochi</b> — <i>Eminem</i>\n"
+            "🔹 <b>Matn</b> — <i>yuragim yonadi sensiz</i>\n"
+            "🔹 <b>Ovozli xabar</b> — musiqani aniqlash\n"
+            "🔹 <b>Video/Audio</b> — fayldan musiqani topish\n"
+            "🔹 <b>Link</b> — Instagram, YouTube, Pinterest, Snapchat dan video/rasm yuklash\n\n"
+            "🎵 Natijalar tez topiladi!\n"
+            "📢 Admin: @admin"
+        ),
+        "no_blocked": "🚫 Bloklangan foydalanuvchilar yo'q.",
+        "enter_channel": (
+            "📢 Kanal qo'shish:\n\n"
+            "Format: <code>@username</code> yoki <code>username</code>\n"
+            "Kanal nomini yuboring:"
+        ),
+        "enter_block_id": (
+            "🚫 Block qilish uchun foydalanuvchi ID sini yuboring:\n\n"
+            "Misol: <code>123456789</code>"
+        ),
+        "invalid_id": "❌ Noto'g'ri ID formati.",
+        "groups_list": "👥 <b>Bot qo'shilgan guruhlar:</b>\n\n{groups}",
+        "no_groups": "Guruhlar yo'q.",
+        "lang_stats": "🌐 <b>Tillar bo'yicha foydalanuvchilar:</b>\n\n{stats}",
+        "ffmpeg_missing": "❌ FFmpeg topilmadi! Iltimos, ffmpeg.exe ni o'rnating va PATH ga qo'shing.",
+        "file_not_found": "❌ Fayl topilmadi: {path}",
+        "unknown_message": (
+            "❌ Bu xabar turini tushunmadim.\n\n"
+            "Menga quyidagilarni yuboring:\n"
+            "🎵 Qo'shiq nomi yoki ijrochi\n"
+            "🎙 Ovozli xabar\n"
+            "📎 Audio/Video fayl\n"
+            "🔗 Ijtimoiy tarmoq linki (Instagram, YouTube, Pinterest, Snapchat)"
+        ),
+        "document_received": (
+            "📄 <b>Hujjat qabul qilindi</b>\n\n"
+            "Fayl: <code>{filename}</code>\n"
+            "Hajmi: {size_mb} MB\n\n"
+            "⚠️ Men faqat musiqa, video va linklarni qayta ishlayman. "
+            "Hujjatlar bilan ishlash imkoniyati mavjud emas."
+        ),
+        "quick_search_hint": (
+            "💡 <b>Tez qidiruv:</b>\n"
+            "Qo'shiq nomi yoki ijrochi yozing — 1-2 sekundda topaman!"
+        ),
+        "link_downloaded": (
+            "📎 <b>Link qabul qilindi!</b>\n\n"
+            "🔎 Yuklanmoqda..."
+        ),
+        "video_from_link": (
+            "🎬 <b>Video yuklandi!</b>\n\n"
+            "🎵 Musiqani aniqlash uchun tugmani bosing!"
+        ),
+        "photo_from_link": (
+            "📸 <b>Rasm yuklandi!</b>\n\n"
+            "❤️ @skachatinstavideo_bot"
+        ),
+    },
+    "uz_kr": {
+        "choose_lang": "🌐 Тилни танланг:",
+        "welcome": (
+            "✨ @skachatinstavideo_bot га хуш келибсиз!\n\n"
+            "🎵 Ном, ижрочи, матн ёки линк орқали қидириш.\n"
+            "🎙 Овозли хабар ва видео орқали мусиқани аниқлаш.\n"
+            "📎 Instagram, YouTube ва бошқа ижтимоий тармоқлардан медиа юборинг.\n\n"
+            "🔗 Линк, 🎙 Voice ёки 📝 Матн юборинг!"
+        ),
+        "force_sub": "❌ <b>Ботдан фойдаланиш учун қуйидаги каналларга аъзо бўлинг:</b>",
+        "check_sub": "✅ Аъзоликни текшириш",
+        "not_subscribed": "❌ Сиз ҳали барча каналларга аъзо бўлмагансиз!",
+        "sub_ok_group": "✅ Аъзолик тасдиқланди! Энди мусиқа қидиришингиз мумкин.",
+        "searching": "🔍 Қидирилмоқда...",
+        "search_results": "🔎 <b>Топилган мусиқалар:</b>\n\n",
+        "no_results": "❌ Ҳеч нарса топилмади.",
+        "music_selected": "🎵 {artist} - {title}\n\n🔎 Юкланмоқда...",
+        "recognizing": "🔎 Аниқланмоқда...",
+        "not_recognized": "❌ Мусиқа аниқланмади. Илтимос, сифатли аудио юборинг.",
+        "downloading": "🔎 Юкланмоқда...",
+        "download_done": "✅ Юкланди!",
+        "download_error": (
+            "Afsuski ушбу медиа файлни юклай олмадим.\n\n"
+            "Медиа файлни юклаш учун, ботни гуруҳга қўшинг"
+        ),
+        "download_failed_group": (
+            "Afsuski ушбу медиа файлни юклай олмадим.\n\n"
+            "Медиа файлни юклаш учун, ботни гуруҳга қўшинг"
+        ),
+        "music_not_found_group": (
+            "⚠️ Afsuski мусиқа топилмади\n\n"
+            "Мусиқани топиш учун гуруҳга қўшинг👇"
+        ),
+        "file_too_large": (
+            "❌ Файл ҳажми жуда катта ({size_mb} MB).\n"
+            "Telegram бот орқали максимал юбориш ҳажми: {limit_mb} MB.\n"
+            "Илтимос, кичикроқ файл юборинг ёки тўғридан-тўғри линк орқали юклаб олинг."
+        ),
+        "photo_downloaded": (
+            "📸 <b>Расм қабул қилинди!</b>\n\n"
+            "❤️ @skachatinstavideo_bot"
+        ),
+        "video_downloaded": (
+            "🎬 <b>Видео қабул қилинди!</b>\n\n"
+            "🎵 Мусиқасини топиш учун тугмани босинг!"
+        ),
+        "extracting_music": "🎵 Мусиқа аниқланмоқда...",
+        "music_found_from_video": (
+            "🎵 <b>Мусиқа топилди!</b>\n\n"
+            "🎤 Ижрочи: {artist}\n"
+            "🎼 Қўшиқ: {title}\n\n"
+            "🔎 Қидирилмоқда..."
+        ),
+        "admin_welcome": (
+            "🔧 <b>Админ Панел</b>\n\n"
+            "Керакли бўлимни танланг:"
+        ),
+        "stats": (
+            "📊 <b>Статистика</b>\n\n"
+            "👤 Жами фойдаланувчилар: <b>{total}</b>\n"
+            "⚡ Фаол (24 соат): <b>{active}</b>\n"
+            "🆕 Янги (7 кун): <b>{week}</b>\n"
+            "🌐 Тиллар бўйича:\n{langs}\n\n"
+            "🔥 Топ 10 қидирувлар:\n{top}"
+        ),
+        "broadcast_ask_text": "📨 Broadcast матнини юборинг:",
+        "broadcast_ask_media": "📎 Broadcast учун медиа юборинг (расм, видео, аудио):",
+        "broadcast_ask_caption": (
+            "📎 Медиа қабул қилинди.\n\n"
+            "📝 Ёзув (caption) қўшиш учун матн юборинг:\n"
+            "⏭️ Ўтказиб юбориш учун /skip деб ёзинг:"
+        ),
+        "broadcast_done": "✅ Хабар <b>{count}</b> та фойдаланувчи ва гуруҳга юборилди.",
+        "blocked": "🚫 Сиз ботдан блоклангансиз.",
+        "blacklist_add": "🚫 Фойдаланувчи блокланди.",
+        "blacklist_remove": "✅ Фойдаланувчи блокдан чиқарилди.",
+        "channel_add": "📢 Канал қўшилди.",
+        "channel_remove": "❌ Канал ўчирилди.",
+        "profile": (
+            "👤 <b>Профил</b>\n\n"
+            "🆔 ID: <code>{telegram_id}</code>\n"
+            "👤 Исм: {fullname}\n"
+            "🔤 Username: {username}\n"
+            "🌐 Тил: {language}"
+        ),
+        "help_text": (
+            "🎵 @skachatinstavideo_bot ёрдам\n\n"
+            "🔹 <b>Қўшиқ номи</b> — <i>Eminem Mockingbird</i>\n"
+            "🔹 <b>Ижрочи</b> — <i>Eminem</i>\n"
+            "🔹 <b>Матн</b> — <i>yuragim yonadi sensiz</i>\n"
+            "🔹 <b>Овозли хабар</b> — мусиқани аниқлаш\n"
+            "🔹 <b>Видео/Аудио</b> — файлдан мусиқани топиш\n"
+            "🔹 <b>Link</b> — Instagram, YouTube, Pinterest, Snapchat дан видео/расм юклаш\n\n"
+            "🎵 Натижалар тез топилади!\n"
+            "📢 Админ: @admin"
+        ),
+        "no_blocked": "🚫 Блокланган фойдаланувчилар йўқ.",
+        "enter_channel": (
+            "📢 Канал қўшиш:\n\n"
+            "Формат: <code>@username</code> ёки <code>username</code>\n"
+            "Канал номини юборинг:"
+        ),
+        "enter_block_id": (
+            "🚫 Блок қилиш учун фойдаланувчи ID сини юборинг:\n\n"
+            "Мисол: <code>123456789</code>"
+        ),
+        "invalid_id": "❌ Нотўғри ID формати.",
+        "groups_list": "👥 <b>Бот қўшилган гуруҳлар:</b>\n\n{groups}",
+        "no_groups": "Гуруҳлар йўқ.",
+        "lang_stats": "🌐 <b>Тиллар бўйича фойдаланувчилар:</b>\n\n{stats}",
+        "ffmpeg_missing": "❌ FFmpeg топилмади! Илтимос, ffmpeg.exe ни ўрнating ва PATH га қўшинг.",
+        "file_not_found": "❌ Файл топилмади: {path}",
+        "unknown_message": (
+            "❌ Бу хабар турини тушунмадим.\n\n"
+            "Манга қуйидагиларни юборинг:\n"
+            "🎵 Қўшиқ номи ёки ижрочи\n"
+            "🎙 Овозли хабар\n"
+            "📎 Аудио/Видео файл\n"
+            "🔗 Ижтимоий тармоқ линки (Instagram, YouTube, Pinterest, Snapchat)"
+        ),
+        "document_received": (
+            "📄 <b>Ҳужжат қабул қилинди</b>\n\n"
+            "Файл: <code>{filename}</code>\n"
+            "Ҳажми: {size_mb} MB\n\n"
+            "⚠️ Мен фақат мусиқа, видео ва линкларни қайта ишлайман. "
+            "Ҳужжатлар билан ишлаш имконияти мавжуд эмас."
+        ),
+        "quick_search_hint": (
+            "💡 <b>Тез қидирув:</b>\n"
+            "Қўшиқ номи ёки ижрочи ёзинг — 1-2 секундда топаман!"
+        ),
+        "link_downloaded": (
+            "📎 <b>Link қабул қилинди!</b>\n\n"
+            "🔎 Юкланмоқда..."
+        ),
+        "video_from_link": (
+            "🎬 <b>Видео юкланди!</b>\n\n"
+            "🎵 Мусиқани аниқлаш учун тугмани босинг:"
+        ),
+        "photo_from_link": (
+            "📸 <b>Расм юкланди!</b>\n\n"
+            "❤️ @skachatinstavideo_bot"
+        ),
+    },
+    "ru": {
+        "choose_lang": "🌐 Выберите язык:",
+        "welcome": (
+            "✨ Добро пожаловать в @skachatinstavideo_bot!\n\n"
+            "🎵 Поиск по названию, исполнителю, тексту или ссылке.\n"
+            "🎙 Голосовое сообщение и видео для распознавания музыки.\n"
+            "📎 Загружайте медиа из Instagram, YouTube и других сетей.\n\n"
+            "Отправьте 🔗 Ссылку, 🎙 Голос или 📝 Текст!"
+        ),
+        "force_sub": "❌ <b>Для использования бота подпишитесь на каналы:</b>",
+        "check_sub": "✅ Проверить подписку",
+        "not_subscribed": "❌ Вы еще не подписаны на все каналы!",
+        "sub_ok_group": "✅ Подписка подтверждена! Теперь можно искать музыку.",
+        "searching": "🔍 Поиск...",
+        "search_results": "🔎 <b>Найденные треки:</b>\n\n",
+        "no_results": "❌ Ничего не найдено.",
+        "music_selected": "🎵 {artist} - {title}\n\n🔎 Загрузка...",
+        "recognizing": "🔎 Распознавание...",
+        "not_recognized": "❌ Музыка не распознана. Отправьте качественное аудио.",
+        "downloading": "🔎 Загрузка...",
+        "download_done": "✅ Загружено!",
+        "download_error": (
+            "К сожалению, я не смог загрузить этот медиафайл.\n\n"
+            "Чтобы загрузить медиафайл, добавьте бота в группу"
+        ),
+        "download_failed_group": (
+            "К сожалению, я не смог загрузить этот медиафайл.\n\n"
+            "Чтобы загрузить медиафайл, добавьте бота в группу"
+        ),
+        "music_not_found_group": (
+            "⚠️ К сожалению, музыка не найдена\n\n"
+            "Чтобы найти музыку, добавьте бота в группу👇"
+        ),
+        "file_too_large": (
+            "❌ Размер файла слишком большой ({size_mb} МБ).\n"
+            "Максимальный размер отправки через Telegram бот: {limit_mb} МБ.\n"
+            "Пожалуйста, отправьте файл меньшего размера или скачайте по прямой ссылке."
+        ),
+        "photo_downloaded": (
+            "📸 <b>Фото получено!</b>\n\n"
+            "❤️ @skachatinstavideo_bot"
+        ),
+        "video_downloaded": (
+            "🎬 <b>Видео получено!</b>\n\n"
+            "🎵 Нажмите, чтобы найти музыку!"
+        ),
+        "extracting_music": "🎵 Извлечение музыки...",
+        "music_found_from_video": (
+            "🎵 <b>Музыка найдена!</b>\n\n"
+            "🎤 Исполнитель: {artist}\n"
+            "🎼 Трек: {title}\n\n"
+            "🔎 Поиск..."
+        ),
+        "admin_welcome": (
+            "🔧 <b>Панель администратора</b>\n\n"
+            "Выберите раздел:"
+        ),
+        "stats": (
+            "📊 <b>Аналитика</b>\n\n"
+            "👤 Всего пользователей: <b>{total}</b>\n"
+            "⚡ Активные (24 ч): <b>{active}</b>\n"
+            "🆕 Новые (7 дней): <b>{week}</b>\n"
+            "🌐 По языкам:\n{langs}\n\n"
+            "🔥 Топ 10 запросов:\n{top}"
+        ),
+        "broadcast_ask_text": "📨 Отправьте текст для рассылки:",
+        "broadcast_ask_media": "📎 Отправьте медиа для рассылки (фото, видео, аудио):",
+        "broadcast_ask_caption": (
+            "📎 Медиа получено.\n\n"
+            "📝 Отправьте подпись (caption):\n"
+            "⏭️ Или напишите /skip, чтобы пропустить:"
+        ),
+        "broadcast_done": "✅ Сообщение отправлено <b>{count}</b> пользователям и группам.",
+        "blocked": "🚫 Вы заблокированы в боте.",
+        "blacklist_add": "🚫 Пользователь заблокирован.",
+        "blacklist_remove": "✅ Пользователь разблокирован.",
+        "channel_add": "📢 Канал добавлен.",
+        "channel_remove": "❌ Канал удалён.",
+        "profile": (
+            "👤 <b>Профиль</b>\n\n"
+            "🆔 ID: <code>{telegram_id}</code>\n"
+            "👤 Имя: {fullname}\n"
+            "🔤 Username: {username}\n"
+            "🌐 Язык: {language}"
+        ),
+        "help_text": (
+            "🎵 @skachatinstavideo_bot — помощь\n\n"
+            "🔹 <b>Название трека</b> — <i>Eminem Mockingbird</i>\n"
+            "🔹 <b>Исполнитель</b> — <i>Eminem</i>\n"
+            "🔹 <b>Текст песни</b> — <i>yuragim yonadi sensiz</i>\n"
+            "🔹 <b>Голосовое сообщение</b> — распознавание музыки\n"
+            "🔹 <b>Видео/Аудио</b> — поиск музыки из файла\n"
+            "🔹 <b>Ссылка</b> — загрузка видео/фото из Instagram, YouTube, Pinterest, Snapchat\n\n"
+            "🎵 Результаты найдутся быстро!\n"
+            "📢 Админ: @admin"
+        ),
+        "no_blocked": "🚫 Заблокированных пользователей нет.",
+        "enter_channel": (
+            "📢 Добавить канал:\n\n"
+            "Формат: <code>@username</code> или <code>username</code>\n"
+            "Отправьте название канала:"
+        ),
+        "enter_block_id": (
+            "🚫 Отправьте ID пользователя для блокировки:\n\n"
+            "Пример: <code>123456789</code>"
+        ),
+        "invalid_id": "❌ Неверный формат ID.",
+        "groups_list": "👥 <b>Группы бота:</b>\n\n{groups}",
+        "no_groups": "Групп нет.",
+        "lang_stats": "🌐 <b>Пользователи по языкам:</b>\n\n{stats}",
+        "ffmpeg_missing": "❌ FFmpeg не найден! Установите ffmpeg и добавьте в PATH.",
+        "file_not_found": "❌ Файл не найден: {path}",
+        "unknown_message": (
+            "❌ Не понял этот тип сообщения.\n\n"
+            "Отправьте мне:\n"
+            "🎵 Название или исполнитель\n"
+            "🎙 Голосовое сообщение\n"
+            "📎 Аудио/Видео файл\n"
+            "🔗 Ссылка на соцсеть (Instagram, YouTube, Pinterest, Snapchat)"
+        ),
+        "document_received": (
+            "📄 <b>Документ получен</b>\n\n"
+            "Файл: <code>{filename}</code>\n"
+            "Размер: {size_mb} МБ\n\n"
+            "⚠️ Я работаю только с музыкой, видео и ссылками. "
+            "Работа с документами недоступна."
+        ),
+        "quick_search_hint": (
+            "💡 <b>Быстрый поиск:</b>\n"
+            "Введите название или исполнителя — найду за 1-2 секунды!"
+        ),
+        "link_downloaded": (
+            "📎 <b>Ссылка получена!</b>\n\n"
+            "🔎 Загрузка..."
+        ),
+        "video_from_link": (
+            "🎬 <b>Видео загружено!</b>\n\n"
+            "🎵 Нажмите кнопку для распознавания музыки:"
+        ),
+        "photo_from_link": (
+            "📸 <b>Фото загружено!</b>\n\n"
+            "❤️ @skachatinstavideo_bot"
+        ),
+    },
+    "en": {
+        "choose_lang": "🌐 Choose language:",
+        "welcome": (
+            "✨ Welcome to @skachatinstavideo_bot!\n\n"
+            "🎵 <b>Music search</b> — by name, artist, lyrics\n"
+            "🎙 <b>Voice message</b> — identify music\n"
+            "📎 <b>Link</b> — download video/photo from Instagram, YouTube and other social networks\n\n"
+            "Send a 🔗 <b>Link</b>, 🎙 <b>Voice</b>, 📝 <b>Text</b>!"
+        ),
+        "force_sub": "❌ <b>Please subscribe to these channels to use the bot:</b>",
+        "check_sub": "✅ Check subscription",
+        "not_subscribed": "❌ You haven't subscribed to all channels yet!",
+        "sub_ok_group": "✅ Subscription confirmed! You can now search for music.",
+        "searching": "🔍 Searching...",
+        "search_results": "🔎 <b>Found tracks:</b>\n\n",
+        "no_results": "❌ Nothing found.",
+        "music_selected": "🎵 {artist} - {title}\n\n🔎 Downloading...",
+        "recognizing": "🔎 Identifying...",
+        "not_recognized": "❌ Music not recognized. Please send quality audio.",
+        "downloading": "🔎 Downloading...",
+        "download_done": "✅ Done!",
+        "download_error": (
+            "Sorry, I couldn't download this media file.\n\n"
+            "To download media, add the bot to a group"
+        ),
+        "download_failed_group": (
+            "Sorry, I couldn't download this media file.\n\n"
+            "To download media, add the bot to a group"
+        ),
+        "music_not_found_group": (
+            "⚠️ Sorry, music not found\n\n"
+            "To find music, add the bot to a group👇"
+        ),
+        "file_too_large": (
+            "❌ File is too large ({size_mb} MB).\n"
+            "Max file size via Telegram bot: {limit_mb} MB.\n"
+            "Please send a smaller file or download via direct link."
+        ),
+        "photo_downloaded": (
+            "📸 <b>Photo received!</b>\n\n"
+            "❤️ @skachatinstavideo_bot"
+        ),
+        "video_downloaded": (
+            "🎬 <b>Video received!</b>\n\n"
+            "🎵 Press the button to find the music!"
+        ),
+        "extracting_music": "🎵 Extracting music...",
+        "music_found_from_video": (
+            "🎵 <b>Music found!</b>\n\n"
+            "🎤 Artist: {artist}\n"
+            "🎼 Track: {title}\n\n"
+            "🔎 Searching..."
+        ),
+        "admin_welcome": (
+            "🔧 <b>Admin Panel</b>\n\n"
+            "Select a section:"
+        ),
+        "stats": (
+            "📊 <b>Analytics</b>\n\n"
+            "👤 Total users: <b>{total}</b>\n"
+            "⚡ Active (24h): <b>{active}</b>\n"
+            "🆕 New (7 days): <b>{week}</b>\n"
+            "🌐 By language:\n{langs}\n\n"
+            "🔥 Top 10 searches:\n{top}"
+        ),
+        "broadcast_ask_text": "📨 Send broadcast text:",
+        "broadcast_ask_media": "📎 Send broadcast media (photo, video, audio):",
+        "broadcast_ask_caption": (
+            "📎 Media received.\n\n"
+            "📝 Send a caption:\n"
+            "⏭️ Write /skip to skip:"
+        ),
+        "broadcast_done": "✅ Message sent to <b>{count}</b> users and groups.",
+        "blocked": "🚫 You are blocked from this bot.",
+        "blacklist_add": "🚫 User blocked.",
+        "blacklist_remove": "✅ User unblocked.",
+        "channel_add": "📢 Channel added.",
+        "channel_remove": "❌ Channel removed.",
+        "profile": (
+            "👤 <b>Profile</b>\n\n"
+            "🆔 ID: <code>{telegram_id}</code>\n"
+            "👤 Name: {fullname}\n"
+            "🔤 Username: {username}\n"
+            "🌐 Language: {language}"
+        ),
+        "help_text": (
+            "🎵 @skachatinstavideo_bot help\n\n"
+            "🔹 <b>Track name</b> — <i>Eminem Mockingbird</i>\n"
+            "🔹 <b>Artist</b> — <i>Eminem</i>\n"
+            "🔹 <b>Lyrics</b> — <i>yuragim yonadi sensiz</i>\n"
+            "🔹 <b>Voice message</b> — identify music from audio\n"
+            "🔹 <b>Video/Audio</b> — find music from file\n"
+            "🔹 <b>Link</b> — download video/photo from Instagram, YouTube, Pinterest, Snapchat\n\n"
+            "🎵 All music is found via <b>YouTube</b>!\n"
+            "📢 Admin: @admin"
+        ),
+        "no_blocked": "🚫 No blocked users.",
+        "enter_channel": (
+            "📢 Add channel:\n\n"
+            "Format: <code>@username</code> or <code>username</code>\n"
+            "Send channel name:"
+        ),
+        "enter_block_id": (
+            "🚫 Send user ID to block:\n\n"
+            "Example: <code>123456789</code>"
+        ),
+        "invalid_id": "❌ Invalid ID format.",
+        "groups_list": "👥 <b>Bot groups:</b>\n\n{groups}",
+        "no_groups": "No groups.",
+        "lang_stats": "🌐 <b>Users by language:</b>\n\n{stats}",
+        "ffmpeg_missing": "❌ FFmpeg not found! Please install ffmpeg and add to PATH.",
+        "file_not_found": "❌ File not found: {path}",
+        "unknown_message": (
+            "❌ I don't understand this message type.\n\n"
+            "Send me:\n"
+            "🎵 Track name or artist\n"
+            "🎙 Voice message\n"
+            "📎 Audio/Video file\n"
+            "🔗 Social media link (Instagram, YouTube, Pinterest, Snapchat)"
+        ),
+        "document_received": (
+            "📄 <b>Document received</b>\n\n"
+            "File: <code>{filename}</code>\n"
+            "Size: {size_mb} MB\n\n"
+            "⚠️ I only process music, video, and links. "
+            "Document handling is not available."
+        ),
+        "quick_search_hint": (
+            "💡 <b>Quick search:</b>\n"
+            "Type a track name or artist — I'll find it in 1-2 seconds!"
+        ),
+        "link_downloaded": (
+            "📎 <b>Link received!</b>\n\n"
+            "🔎 Downloading..."
+        ),
+        "video_from_link": (
+            "🎬 <b>Video downloaded!</b>\n\n"
+            "🎵 Press the button to recognize music:"
+        ),
+        "photo_from_link": (
+            "📸 <b>Photo downloaded!</b>\n\n"
+            "❤️ @skachatinstavideo_bot"
+        ),
+    },
+}
+
+
+# ========================== DATABASE ==========================
+class Database:
+    def __init__(self, url: str):
+        self.url = url
+        self.pool: asyncpg.Pool | None = None
+
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(self.url, min_size=2, max_size=10)
+        await self._create_tables()
+
+    async def _create_tables(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                r"""
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id BIGINT PRIMARY KEY,
+                    fullname VARCHAR(255),
+                    username VARCHAR(255),
+                    language VARCHAR(10) DEFAULT 'uz',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    last_active TIMESTAMP DEFAULT NOW(),
+                    is_blocked BOOLEAN DEFAULT FALSE
+                );
+                CREATE TABLE IF NOT EXISTS groups_bot (
+                    group_id BIGINT PRIMARY KEY,
+                    title VARCHAR(255),
+                    added_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS channels (
+                    id SERIAL PRIMARY KEY,
+                    username VARCHAR(100) UNIQUE,
+                    title VARCHAR(255),
+                    active BOOLEAN DEFAULT TRUE,
+                    added_by BIGINT,
+                    added_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS searches (
+                    id SERIAL PRIMARY KEY,
+                    query TEXT,
+                    type VARCHAR(50),
+                    user_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS musics (
+                    id SERIAL PRIMARY KEY,
+                    title VARCHAR(255),
+                    artist VARCHAR(255),
+                    file_id VARCHAR(500),
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(title, artist)
+                );
+                """
+            )
+
+    async def get_user(self, telegram_id: int):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                "SELECT * FROM users WHERE telegram_id = $1", telegram_id
+            )
+
+    async def add_user(self, telegram_id: int, fullname: str, username: str | None):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                r"""
+                INSERT INTO users (telegram_id, fullname, username)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (telegram_id) DO UPDATE
+                SET fullname = $2, username = $3, last_active = NOW()
+                """,
+                telegram_id, fullname, username,
+            )
+
+    async def set_language(self, telegram_id: int, language: str):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET language = $1 WHERE telegram_id = $2",
+                language, telegram_id,
+            )
+
+    async def update_activity(self, telegram_id: int):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET last_active = NOW() WHERE telegram_id = $1",
+                telegram_id,
+            )
+
+    async def add_search(self, query: str, type_: str, user_id: int):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO searches (query, type, user_id) VALUES ($1, $2, $3)",
+                query, type_, user_id,
+            )
+
+    async def get_stats(self):
+        async with self.pool.acquire() as conn:
+            total = await conn.fetchval("SELECT COUNT(*) FROM users")
+            active = await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE last_active > NOW() - INTERVAL '24 hours'"
+            )
+            week = await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '7 days'"
+            )
+            top = await conn.fetch(
+                r"""
+                SELECT query, COUNT(*) as c
+                FROM searches
+                GROUP BY query
+                ORDER BY c DESC
+                LIMIT 10
+                """
+            )
+            return total, active, week, top
+
+    async def get_language_stats(self):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT language, COUNT(*) as c FROM users GROUP BY language ORDER BY c DESC"
+            )
+
+    async def get_channels(self):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT * FROM channels WHERE active = TRUE ORDER BY id"
+            )
+
+    async def add_channel(self, username: str, title: str, added_by: int):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                r"""
+                INSERT INTO channels (username, title, added_by)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (username) DO UPDATE
+                SET active = TRUE, title = $2, added_by = $3
+                """,
+                username, title, added_by,
+            )
+
+    async def remove_channel(self, username: str):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE channels SET active = FALSE WHERE username = $1",
+                username,
+            )
+
+    async def add_group(self, group_id: int, title: str):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                r"""
+                INSERT INTO groups_bot (group_id, title) VALUES ($1, $2)
+                ON CONFLICT (group_id) DO UPDATE SET title = $2
+                """,
+                group_id, title,
+            )
+
+    async def get_groups(self):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("SELECT * FROM groups_bot ORDER BY added_at DESC")
+
+    async def get_all_users(self):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT telegram_id FROM users WHERE is_blocked = FALSE"
+            )
+
+    async def block_user(self, telegram_id: int):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET is_blocked = TRUE WHERE telegram_id = $1",
+                telegram_id,
+            )
+
+    async def unblock_user(self, telegram_id: int):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET is_blocked = FALSE WHERE telegram_id = $1",
+                telegram_id,
+            )
+
+    async def is_blocked(self, telegram_id: int):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT is_blocked FROM users WHERE telegram_id = $1", telegram_id
+            )
+            return row["is_blocked"] if row else False
+
+    async def get_blocked_users(self):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT telegram_id, fullname, username FROM users WHERE is_blocked = TRUE ORDER BY telegram_id"
+            )
+
+    async def get_music_file_id(self, title: str, artist: str):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT file_id FROM musics WHERE title = $1 AND artist = $2",
+                title, artist,
+            )
+            return row["file_id"] if row else None
+
+    async def save_music_file_id(self, title: str, artist: str, file_id: str):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                r"""
+                INSERT INTO musics (title, artist, file_id) VALUES ($1, $2, $3)
+                ON CONFLICT (title, artist) DO UPDATE SET file_id = $3
+                """,
+                title, artist, file_id,
+            )
+
+# ========================== GLOBAL STATE ==========================
+user_search_state: dict[int, dict] = {}
+admin_state: dict[int, dict] = {}
+video_recognition_state: dict[int, dict] = {}
+link_download_state: dict[int, dict[str, Any]] = {}
+
+db: Database | None = None
+
+# ========================== KEYBOARDS ==========================
+def lang_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🇺🇿 O'zbekcha", callback_data="lang:uz"),
+                InlineKeyboardButton(text="🇺🇿 Ўзбекча", callback_data="lang:uz_kr"),
+            ],
+            [
+                InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang:ru"),
+                InlineKeyboardButton(text="🇺🇸 English", callback_data="lang:en"),
+            ],
+        ]
+    )
+
+
+def main_menu_kb(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🌐 " + (
+                        "Tilni o'zgartirish" if lang == "uz"
+                        else "Тилни ўзгартириш" if lang == "uz_kr"
+                        else "Сменить язык" if lang == "ru"
+                        else "Change language"
+                    ),
+                    callback_data="lang_menu",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👤 " + ("Profil" if lang == "uz" else "Профил" if lang == "uz_kr" else "Профиль" if lang == "ru" else "Profile"),
+                    callback_data="profile",
+                )
+            ],
+        ]
+    )
+
+
+# ========================== ADMIN KEYBOARDS ==========================
+def admin_main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📢 Majburiy obuna", callback_data="admin:channels"),
+                InlineKeyboardButton(text="🌐 Tillar", callback_data="admin:langs"),
+            ],
+            [
+                InlineKeyboardButton(text="📊 Analitika", callback_data="admin:stats"),
+                InlineKeyboardButton(text="👥 Guruhlar", callback_data="admin:groups"),
+            ],
+            [
+                InlineKeyboardButton(text="📨 Reklama", callback_data="admin:broadcast"),
+                InlineKeyboardButton(text="🚫 Blacklist", callback_data="admin:blacklist"),
+            ],
+            [
+                InlineKeyboardButton(text="❌ Panelni yopish", callback_data="admin:close"),
+            ],
+        ]
+    )
+
+
+def admin_back_kb(to: str = "admin:back") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Orqaga", callback_data=to)]
+        ]
+    )
+
+
+def channels_kb(channels: list) -> InlineKeyboardMarkup:
+    kb = []
+    for ch in channels:
+        kb.append([
+            InlineKeyboardButton(
+                text=f"❌ {ch['title'] or ch['username']}",
+                callback_data=f"admin:ch_del:{ch['username']}"
+            )
+        ])
+    kb.append([InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="admin:ch_add")])
+    kb.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:back")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def blacklist_kb(users: list) -> InlineKeyboardMarkup:
+    kb = []
+    for u in users:
+        name = u["fullname"] or f"ID:{u['telegram_id']}"
+        kb.append([
+            InlineKeyboardButton(
+                text=f"✅ {name}",
+                callback_data=f"admin:unblock:{u['telegram_id']}"
+            )
+        ])
+    kb.append([InlineKeyboardButton(text="➕ Block qilish", callback_data="admin:block_add")])
+    kb.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:back")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def broadcast_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📝 Matn yuborish", callback_data="admin:bc_text"),
+                InlineKeyboardButton(text="📎 Media yuborish", callback_data="admin:bc_media"),
+            ],
+            [InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:back")],
+        ]
+    )
+
+
+def broadcast_skip_caption_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏭️ O'tkazib yuborish", callback_data="admin:bc_skip")],
+        ]
+    )
+
+
+# ========================== LINK HELPERS ==========================
+def is_social_media_url(text: str) -> bool:
+    patterns = [
+        r'https?://(?:www\.)?instagram\.com/\S+',
+        r'https?://(?:www\.)?youtube\.com/\S+',
+        r'https?://youtu\.be/\S+',
+        r'https?://(?:www\.)?tiktok\.com/\S+',
+        r'https?://(?:www\.)?vt\.tiktok\.com/\S+',
+        r'https?://(?:www\.)?vm\.tiktok\.com/\S+',
+        r'https?://(?:www\.)?facebook\.com/\S+',
+        r'https?://(?:www\.)?twitter\.com/\S+',
+        r'https?://(?:www\.)?x\.com/\S+',
+        r'https?://(?:www\.)?soundcloud\.com/\S+',
+        r'https?://(?:www\.)?likee\.video/\S+',
+        r'https?://l\.likee\.video/\S+',
+        r'https?://(?:www\.)?threads\.net/\S+',
+        r'https?://(?:www\.)?threads\.com/\S+',
+        r'https?://(?:www\.)?pinterest\.com/\S+',
+        r'https?://(?:www\.)?pin\.it/\S+',
+        r'https?://(?:www\.)?snapchat\.com/\S+',
+        r'https?://(?:www\.)?reddit\.com/\S+',
+        r'https?://(?:www\.)?vimeo\.com/\S+',
+        r'https?://(?:www\.)?dailymotion\.com/\S+',
+        r'https?://(?:www\.)?twitch\.tv/\S+',
+        r'https?://(?:www\.)?vk\.com/\S+',
+        r'https?://(?:www\.)?ok\.ru/\S+',
+    ]
+    return any(re.search(p, text) for p in patterns)
+
+
+async def resolve_short_url(url: str) -> str:
+    if re.search(r'https?://(?:vt|vm)\.tiktok\.com/\S+', url):
+        return url
+    if re.search(r'https?://(?:www\.)?pin\.it/\S+', url):
+        try:
+            import urllib.request
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://www.pinterest.com/',
+            })
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                final_url = resp.geturl()
+                if final_url != url and 'pinterest.com' in final_url:
+                    return final_url
+        except Exception:
+            pass
+    if re.search(r'https?://l\.likee\.video/v/\S+', url):
+        match = re.search(r'/v/([A-Za-z0-9]+)', url)
+        if match:
+            post_id = match.group(1)
+            try:
+                import urllib.request
+                import ssl
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                api_url = f"https://likee.video/v/{post_id}"
+                req = urllib.request.Request(api_url, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                })
+                with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                    final_url = resp.geturl()
+                    if final_url != 'https://likee.video/':
+                        return final_url
+            except Exception:
+                pass
+    return url
+
+
+# ========================== FILE UTILS ==========================
+def _cleanup_file(path: str):
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+# ========================== SHAZAM RECOGNITION ==========================
+async def extract_audio_ffmpeg(input_path: str) -> str:
+    input_path = os.path.normpath(input_path)
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Video fayl topilmadi: {input_path}")
+
+    output_path = input_path.rsplit(".", 1)[0] + "_audio.mp3"
+    output_path = os.path.normpath(output_path)
+
+    ffmpeg_cmd = find_ffmpeg_cmd()
+    if not ffmpeg_cmd:
+        raise RuntimeError("FFmpeg topilmadi!")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg_cmd, "-version",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=5)
+    except (FileNotFoundError, asyncio.TimeoutError):
+        raise RuntimeError("FFmpeg topilmadi!")
+
+    proc = await asyncio.create_subprocess_exec(
+        ffmpeg_cmd, "-y", "-i", input_path,
+        "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
+        output_path,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+
+    if not os.path.exists(output_path):
+        err_msg = stderr.decode(errors="ignore") if stderr else "Noma'lum xatolik"
+        raise RuntimeError(f"FFmpeg audio ajratishda xatolik: {err_msg}")
+
+    return output_path
+
+
+async def recognize_with_shazam(file_path: str):
+    if shazam_client is None:
+        logging.warning("ShazamIO o'rnatilmagan, aniqlash o'tkazib yuboriladi")
+        return None
+    try:
+        result = await shazam_client.recognize(file_path)
+        if result and "track" in result:
+            track = result["track"]
+            title = track.get("title", "Noma'lum")
+            artist = track.get("subtitle", "Noma'lum")
+            return {"title": title, "artist": artist}
+    except Exception as e:
+        logging.warning(f"Shazam recognition error: {e}")
+    return None
+
+
+# ========================== FORCE SUB GROUP ==========================
+async def check_and_force_sub_group(message: Message, lang: str) -> bool:
+    if message.chat.type not in ("group", "supergroup"):
+        return True
+    channels = await db.get_channels()
+    if not channels:
+        return True
+    is_subbed = await check_subscriptions(message.bot, message.from_user.id, channels)
+    if is_subbed:
+        return True
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for ch in channels:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"📢 {ch['title'] or ch['username']}",
+                url=f"https://t.me/{ch['username']}",
+            )
+        ])
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(
+            text=TEXTS[lang]["check_sub"],
+            callback_data=f"check_sub_group:{message.from_user.id}:{message.message_id}"
+        )
+    ])
+    await message.reply(TEXTS[lang]["force_sub"], reply_markup=kb)
+    return False
+
+
+# ========================== BROADCAST ==========================
+async def broadcast_to_all(bot: Bot, msg: Message, caption: str | None = None):
+    users = await db.get_all_users()
+    groups = await db.get_groups()
+    count = 0
+    targets = [u["telegram_id"] for u in users] + [g["group_id"] for g in groups]
+    for target_id in targets:
+        try:
+            await msg.copy_to(target_id, caption=caption)
+            count += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    return count
+
+# ========================== ROUTER & HANDLERS ==========================
+router = Router()
+
+
+async def get_lang(user_id: int) -> str:
+    user = await db.get_user(user_id)
+    return user["language"] if user else "uz"
+
+
+# ========================== SEARCH & PAGINATION ==========================
+async def build_search_page(user_id: int, page: int):
+    state = user_search_state.get(user_id)
+    if not state:
+        return None, None
+
+    results = state["results"]
+    query = state.get("query", "")
+    per_page = RESULTS_PER_PAGE
+    total_pages = (len(results) + per_page - 1) // per_page
+    start = page * per_page
+    end = min(start + per_page, len(results))
+    page_results = results[start:end]
+
+    lang = await get_lang(user_id)
+    text = f"🔍 <b>{query}</b>\n\n" if query else TEXTS[lang]["search_results"]
+    kb: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+
+    for i, item in enumerate(page_results, start=start + 1):
+        title = item.get("title", "Noma'lum")
+        uploader = item.get("uploader") or item.get("channel", "—")
+        duration = format_duration(item.get("duration"))
+
+        if len(title) > 45:
+            title = title[:43] + "…"
+
+        text += f"{i}. 🎵 <b>{title}</b> — {uploader} <i>[{duration}]</i>\n"
+
+        btn = InlineKeyboardButton(
+            text=f"{i}",
+            callback_data=f"music:{user_id}:{start + i - 1}"
+        )
+        row.append(btn)
+        if len(row) == 5:
+            kb.append(row)
+            row = []
+
+    if row:
+        kb.append(row)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"page:{user_id}:{page - 1}"))
+    else:
+        nav_row.append(InlineKeyboardButton(text="◀️", callback_data="noop"))
+
+    nav_row.append(InlineKeyboardButton(text="❌", callback_data="close"))
+
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"page:{user_id}:{page + 1}"))
+    else:
+        nav_row.append(InlineKeyboardButton(text="▶️", callback_data="noop"))
+
+    kb.append(nav_row)
+    text += f"\n<i>@{BOT_USERNAME} | Sahifa {page + 1}/{total_pages}</i>"
+
+    return text, InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@router.callback_query(F.data == "noop")
+async def noop_callback(call: CallbackQuery):
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("page:"))
+async def page_callback(call: CallbackQuery):
+    _, user_id_str, page_str = call.data.split(":")
+    user_id = int(user_id_str)
+    page = int(page_str)
+
+    if user_id != call.from_user.id:
+        await call.answer("❌ Bu sizning qidiruvingiz emas!", show_alert=True)
+        return
+
+    state = user_search_state.get(user_id)
+    if not state:
+        await call.answer("❌ Qidiruv topilmadi", show_alert=True)
+        return
+
+    state["page"] = page
+    text, markup = await build_search_page(user_id, page)
+    if text:
+        await call.message.edit_text(text, reply_markup=markup)
+    await call.answer()
+
+
+@router.callback_query(F.data == "close")
+async def close_callback(call: CallbackQuery):
+    await call.message.delete()
+    await call.answer()
+
+@router.callback_query(F.data.startswith("music:"))
+async def select_music(call: CallbackQuery):
+    _, user_id_str, idx_str = call.data.split(":")
+    user_id = int(user_id_str)
+    idx = int(idx_str)
+
+    if user_id != call.from_user.id:
+        await call.answer("❌ Bu sizning qidiruvingiz emas!", show_alert=True)
+        return
+
+    state = user_search_state.get(user_id)
+    if not state or idx >= len(state["results"]):
+        await call.answer("❌ Amal qilmadi", show_alert=True)
+        return
+
+    item = state["results"][idx]
+    title = item.get("title", "Noma'lum")
+    uploader = item.get("uploader") or item.get("channel", "—")
+    video_id = item.get("id", "")
+    url = item.get("url") or f"https://www.youtube.com/watch?v={video_id}"
+
+    lang = await get_lang(user_id)
+    await call.answer()
+
+    # Audio yuklash - Piped/Invidious API orqali
+    safe = re.sub(r'[\\/*?:"<>|]', "_", f"{uploader} - {title}")
+    output_path = os.path.join(tempfile.gettempdir(), f"audio_{safe}_{datetime.now().timestamp():.0f}.mp3")
+
+    audio_path = await download_audio(video_id, output_path)
+
+    if not audio_path or not os.path.exists(audio_path):
+        await call.message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
+        return
+
+    size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+    if size_mb > MAX_SIZE_MB:
+        await call.message.answer(
+            TEXTS[lang]["file_too_large"].format(size_mb=f"{size_mb:.1f}", limit_mb=MAX_SIZE_MB)
+        )
+        _cleanup_file(audio_path)
+        return
+
+    await call.message.answer_audio(
+        audio=FSInputFile(audio_path),
+        title=title,
+        performer=uploader,
+        caption=SHARE_PROMO_CAPTION,
+        reply_markup=build_share_kb(),
+    )
+    _cleanup_file(audio_path)
+
+
+@router.callback_query(F.data.startswith("dl_music:"))
+async def dl_music_callback(call: CallbackQuery):
+    parts = call.data.split(":")
+    if len(parts) < 2:
+        await call.answer("❌", show_alert=True)
+        return
+
+    user_id = int(parts[1])
+    if call.from_user.id != user_id:
+        await call.answer("❌ Bu sizning videongiz emas!", show_alert=True)
+        return
+
+    state = link_download_state.get(user_id)
+    if not state:
+        await call.answer("❌ Fayl topilmadi. Qayta yuklang.", show_alert=True)
+        return
+
+    lang = await get_lang(user_id)
+    path = state.get("path")
+    metadata_title = state.get("title")
+
+    await call.answer()
+
+    try:
+        query = None
+        if path and os.path.exists(path):
+            try:
+                recognize_path = path
+                if path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv')):
+                    recognize_path = await extract_audio_ffmpeg(path)
+
+                shazam_result = await recognize_with_shazam(recognize_path)
+
+                if recognize_path != path:
+                    _cleanup_file(recognize_path)
+
+                if shazam_result:
+                    title = shazam_result.get("title", "")
+                    artist = shazam_result.get("artist", "")
+                    query = f"{artist} {title}".strip()
+            except Exception as e:
+                logging.warning(f"Shazam xatolik: {e}")
+
+        if not query and metadata_title:
+            query = normalize_search_query(metadata_title)
+        if not query and path:
+            query = build_query_from_filename(path)
+
+        if not query:
+            await call.message.answer(TEXTS[lang]["not_recognized"])
+            return
+
+        results = await search_music(query, max_results=15)
+
+        if not results:
+            await call.message.answer(TEXTS[lang]["music_not_found_group"], reply_markup=build_share_kb())
+            return
+
+        user_search_state[user_id] = {
+            "results": results,
+            "page": 0,
+            "query": query,
+            "source": "piped",
+        }
+
+        text, markup = await build_search_page(user_id, 0)
+        if text:
+            await call.message.answer(text, reply_markup=markup)
+
+    except Exception as e:
+        logging.error(f"dl_music error: {e}")
+        await call.message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+
+
+@router.callback_query(F.data.startswith("find_music:"))
+async def find_music_callback(call: CallbackQuery):
+    parts = call.data.split(":")
+    if len(parts) < 2:
+        await call.answer("❌", show_alert=True)
+        return
+
+    user_id = int(parts[1])
+    if call.from_user.id != user_id:
+        await call.answer("❌ Bu sizning videongiz emas!", show_alert=True)
+        return
+
+    state = link_download_state.pop(user_id, None)
+    path = state.get("path") if isinstance(state, dict) else None
+    metadata_title = state.get("title") if isinstance(state, dict) else None
+    if not path or not os.path.exists(path):
+        await call.answer("❌ Fayl topilmadi. Qayta yuklang.", show_alert=True)
+        return
+
+    await call.answer()
+
+    lang = await get_lang(user_id)
+    tmp_path = None
+    recognize_path = None
+    shazam_result = None
+
+    try:
+        tmp_path = path
+        if tmp_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv')):
+            recognize_path = await extract_audio_ffmpeg(tmp_path)
+        else:
+            recognize_path = tmp_path
+
+        shazam_result = await recognize_with_shazam(recognize_path)
+
+    except Exception as e:
+        logging.warning(f"Shazam aniqlashda xatolik: {e}")
+        shazam_result = None
+    finally:
+        if recognize_path and recognize_path != tmp_path and recognize_path != path:
+            _cleanup_file(recognize_path)
+
+    if shazam_result:
+        title = shazam_result.get("title", "Noma'lum")
+        artist = shazam_result.get("artist", "Noma'lum")
+        query = f"{artist} {title}".strip()
+    else:
+        query = None
+        if metadata_title:
+            query = normalize_search_query(metadata_title)
+        if not query:
+            query = build_query_from_filename(path)
+
+        if not query:
+            await call.message.answer(TEXTS[lang]["not_recognized"])
+            _cleanup_file(path)
+            return
+
+    try:
+        youtube_results = await search_music(query, max_results=15)
+
+        if youtube_results:
+            user_search_state[user_id] = {
+                "results": youtube_results,
+                "page": 0,
+                "query": f"🎵 {query}" if shazam_result else query,
+                "source": "piped",
+            }
+
+            text, markup = await build_search_page(user_id, 0)
+            if text:
+                await call.message.answer(text, reply_markup=markup)
+        else:
+            await call.message.answer(TEXTS[lang]["music_not_found_group"], reply_markup=build_share_kb())
+    except Exception as e:
+        logging.error(f"Qidiruvda xatolik: {e}")
+        await call.message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+    finally:
+        _cleanup_file(path)
+
+
+# ========================== START / HELP / PROFILE ==========================
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    if message.from_user.id == ADMIN_ID:
+        await message.answer(TEXTS["uz"]["admin_welcome"], reply_markup=admin_main_kb())
+        return
+
+    user = await db.get_user(message.from_user.id)
+    if not user or not user.get("language"):
+        await message.answer(TEXTS["uz"]["choose_lang"], reply_markup=lang_kb())
+        return
+
+    lang = user["language"]
+    channels = await db.get_channels()
+    is_subbed = await check_subscriptions(message.bot, message.from_user.id, channels)
+
+    if not is_subbed:
+        kb = InlineKeyboardMarkup(inline_keyboard=[])
+        for ch in channels:
+            kb.inline_keyboard.append([
+                InlineKeyboardButton(text=f"📢 {ch['title']}", url=f"https://t.me/{ch['username']}")
+            ])
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=TEXTS[lang]["check_sub"], callback_data="check_sub")
+        ])
+        await message.answer(TEXTS[lang]["force_sub"], reply_markup=kb)
+        return
+
+    await message.answer(TEXTS[lang]["welcome"], reply_markup=main_menu_kb(lang))
+    await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
+
+
+@router.callback_query(F.data.startswith("lang:"))
+async def set_language(call: CallbackQuery):
+    lang = call.data.split(":")[1]
+    await db.add_user(call.from_user.id, call.from_user.full_name, call.from_user.username)
+    await db.set_language(call.from_user.id, lang)
+    await call.message.delete()
+
+    if call.from_user.id == ADMIN_ID:
+        await call.message.answer(TEXTS["uz"]["admin_welcome"], reply_markup=admin_main_kb())
+        return
+
+    channels = await db.get_channels()
+    is_subbed = await check_subscriptions(call.bot, call.from_user.id, channels)
+    if not is_subbed:
+        kb = InlineKeyboardMarkup(inline_keyboard=[])
+        for ch in channels:
+            kb.inline_keyboard.append([
+                InlineKeyboardButton(text=f"📢 {ch['title']}", url=f"https://t.me/{ch['username']}")
+            ])
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=TEXTS[lang]["check_sub"], callback_data="check_sub")
+        ])
+        await call.message.answer(TEXTS[lang]["force_sub"], reply_markup=kb)
+        return
+
+    await call.message.answer(TEXTS[lang]["welcome"], reply_markup=main_menu_kb(lang))
+
+
+@router.callback_query(F.data == "check_sub")
+async def check_sub(call: CallbackQuery):
+    user = await db.get_user(call.from_user.id)
+    lang = user["language"] if user else "uz"
+    channels = await db.get_channels()
+    is_subbed = await check_subscriptions(call.bot, call.from_user.id, channels)
+    if not is_subbed:
+        await call.answer(TEXTS[lang]["not_subscribed"], show_alert=True)
+        return
+    await call.message.delete()
+    await call.message.answer(TEXTS[lang]["welcome"], reply_markup=main_menu_kb(lang))
+
+
+@router.callback_query(F.data.startswith("check_sub_group:"))
+async def check_sub_group_callback(call: CallbackQuery):
+    parts = call.data.split(":")
+    if len(parts) < 3:
+        await call.answer("❌", show_alert=True)
+        return
+    target_user_id = int(parts[1])
+    if call.from_user.id != target_user_id:
+        await call.answer("❌ Bu sizning xabaringiz emas!", show_alert=True)
+        return
+    lang = await get_lang(call.from_user.id)
+    channels = await db.get_channels()
+    is_subbed = await check_subscriptions(call.bot, call.from_user.id, channels)
+    if not is_subbed:
+        await call.answer(TEXTS[lang]["not_subscribed"], show_alert=True)
+        return
+    await call.answer(TEXTS[lang]["sub_ok_group"], show_alert=True)
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
+
+@router.message(Command("help"))
+async def help_cmd(message: Message):
+    lang = await get_lang(message.from_user.id)
+    await message.answer(TEXTS[lang]["help_text"])
+
+# ========================== TEXT HANDLER (LINK + MUSIC SEARCH) ==========================
+@router.message(F.text)
+async def text_handler(message: Message):
+    await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
+    if await db.is_blocked(message.from_user.id):
+        return
+    await db.update_activity(message.from_user.id)
+    lang = await get_lang(message.from_user.id)
+
+    if not await check_and_force_sub_group(message, lang):
+        return
+
+    # Admin state handlers
+    if message.from_user.id == ADMIN_ID and message.from_user.id in admin_state:
+        state_info = admin_state[message.from_user.id]
+        state = state_info.get("state")
+
+        if state == "waiting_broadcast_text":
+            admin_state.pop(message.from_user.id, None)
+            count = await broadcast_to_all(message.bot, message)
+            await message.answer(TEXTS["uz"]["broadcast_done"].format(count=count))
+            await message.answer(TEXTS["uz"]["admin_welcome"], reply_markup=admin_main_kb())
+            return
+        elif state == "waiting_broadcast_media":
+            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption", "media_msg": message}
+            await message.answer(TEXTS["uz"]["broadcast_ask_caption"], reply_markup=broadcast_skip_caption_kb())
+            return
+        elif state == "waiting_broadcast_caption":
+            media_msg = admin_state[message.from_user.id].get("media_msg")
+            caption_text = message.text.strip() if message.text else ""
+            admin_state.pop(message.from_user.id, None)
+            if caption_text == "/skip":
+                caption_text = None
+            if media_msg:
+                count = await broadcast_to_all(message.bot, media_msg, caption=caption_text)
+                await message.answer(TEXTS["uz"]["broadcast_done"].format(count=count))
+            else:
+                await message.answer("❌ Media topilmadi.")
+            await message.answer(TEXTS["uz"]["admin_welcome"], reply_markup=admin_main_kb())
+            return
+        elif state == "waiting_channel":
+            admin_state.pop(message.from_user.id, None)
+            username = message.text.strip().replace("@", "")
+            try:
+                await db.add_channel(username, username, ADMIN_ID)
+                await message.answer(TEXTS["uz"]["channel_add"])
+            except Exception as e:
+                await message.answer(f"❌ Xatolik: {e}")
+            await message.answer(TEXTS["uz"]["admin_welcome"], reply_markup=admin_main_kb())
+            return
+        elif state == "waiting_block_id":
+            admin_state.pop(message.from_user.id, None)
+            try:
+                target_id = int(message.text.strip())
+                await db.block_user(target_id)
+                await message.answer(TEXTS["uz"]["blacklist_add"])
+            except ValueError:
+                await message.answer(TEXTS["uz"]["invalid_id"])
+            except Exception as e:
+                await message.answer(f"❌ Xatolik: {e}")
+            await message.answer(TEXTS["uz"]["admin_welcome"], reply_markup=admin_main_kb())
+            return
+
+    # LINK CHECK: Instagram, YouTube, TikTok, Likee, Threads, Pinterest, Snapchat
+    if is_social_media_url(message.text):
+        try:
+            url_text = message.text.strip()
+
+            if re.search(r'https?://(?:www\.)?threads\.com/', url_text, flags=re.I):
+                url_text = re.sub(r'^(https?://)(?:www\.)?threads\.com/', r"\1www.threads.net/", url_text, flags=re.I)
+
+            url_text = await resolve_short_url(url_text)
+
+            # Instagram uchun maxsus handler
+            if "instagram" in message.text.lower():
+                logging.info(f"[Instagram] Fallback boshlanmoqda: {message.text}")
+
+                direct_path, direct_meta = await download_instagram_direct(message.text)
+                if direct_path and os.path.exists(direct_path):
+                    file_size_mb = os.path.getsize(direct_path) / (1024 * 1024)
+                    ext = direct_path.split(".")[-1].lower()
+                    is_actually_video = direct_meta.get("is_video", False) if direct_meta else False
+                    if not is_actually_video:
+                        is_actually_video = ext in ('mp4', 'mov', 'avi', 'mkv', 'webm')
+
+                    if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp') or not is_actually_video:
+                        if file_size_mb <= 10:
+                            await message.answer_photo(
+                                photo=FSInputFile(direct_path),
+                                caption=SHARE_PROMO_CAPTION,
+                                reply_markup=build_share_kb(),
+                            )
+                        else:
+                            await message.answer(SHARE_PROMO_CAPTION, reply_markup=build_share_kb())
+                        _cleanup_file(direct_path)
+                        return
+                    else:
+                        link_download_state[message.from_user.id] = {
+                            "path": direct_path,
+                            "title": direct_meta.get("title") if direct_meta else None,
+                        }
+                        kb = build_video_kb(message.from_user.id, lang)
+                        if file_size_mb <= 50:
+                            await message.answer_video(
+                                video=FSInputFile(direct_path),
+                                caption=SHARE_PROMO_CAPTION,
+                                reply_markup=kb,
+                            )
+                        else:
+                            await message.answer(SHARE_PROMO_CAPTION, reply_markup=kb)
+                        return
+
+                embed_path = await download_instagram_embed(message.text)
+                if embed_path and os.path.exists(embed_path):
+                    file_size_mb = os.path.getsize(embed_path) / (1024 * 1024)
+                    ext = embed_path.split(".")[-1].lower()
+                    if ext in ('jpg', 'jpeg', 'png', 'webp'):
+                        await message.answer_photo(
+                            photo=FSInputFile(embed_path),
+                            caption=SHARE_PROMO_CAPTION,
+                            reply_markup=build_share_kb(),
+                        )
+                        _cleanup_file(embed_path)
+                        return
+                    else:
+                        link_download_state[message.from_user.id] = {
+                            "path": embed_path,
+                            "title": None,
+                        }
+                        kb = build_video_kb(message.from_user.id, lang)
+                        if file_size_mb <= 50:
+                            await message.answer_video(
+                                video=FSInputFile(embed_path),
+                                caption=SHARE_PROMO_CAPTION,
+                                reply_markup=kb,
+                            )
+                        else:
+                            await message.answer(SHARE_PROMO_CAPTION, reply_markup=kb)
+                        return
+
+                api_path = await download_instagram_api(message.text)
+                if api_path and os.path.exists(api_path):
+                    await message.answer_photo(
+                        photo=FSInputFile(api_path),
+                        caption=TEXTS[lang]["photo_from_link"],
+                        reply_markup=build_share_kb(),
+                    )
+                    _cleanup_file(api_path)
+                    return
+
+                logging.error(f"[Instagram] Barcha usullar ishlamadi: {message.text}")
+                await asyncio.sleep(2)
+                await message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
+                return
+
+            await message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
+            return
+
+        except Exception as e:
+            logging.error(f"Link download error: {e}")
+            await message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+            return
+
+    # MUSIQA QIDIRUVI (Piped/Invidious orqali)
+    query = message.text.strip()
+    if len(query) < 2:
+        await message.answer("⚠️ Kamida 2 ta harf kiriting.")
+        return
+
+    msg = await message.answer(TEXTS[lang]["searching"])
+
+    results = await search_music(query, max_results=20)
+
+    if not results:
+        await msg.edit_text(TEXTS[lang]["music_not_found_group"], reply_markup=build_share_kb())
+        return
+
+    await db.add_search(query, "piped", message.from_user.id)
+
+    user_search_state[message.from_user.id] = {
+        "results": results,
+        "page": 0,
+        "query": query,
+        "source": "piped",
+    }
+
+    text, markup = await build_search_page(message.from_user.id, 0)
+    if text:
+        await msg.edit_text(text, reply_markup=markup)
+
+
+# ========================== PHOTO HANDLER ==========================
+@router.message(F.photo)
+async def photo_handler(message: Message):
+    await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
+    if await db.is_blocked(message.from_user.id):
+        return
+    await db.update_activity(message.from_user.id)
+    lang = await get_lang(message.from_user.id)
+    if not await check_and_force_sub_group(message, lang):
+        return
+    await message.answer(
+        "🖼 <b>Rasm qabul qilindi!</b>\n\n"
+        "Rasmdan musiqa aniqlash hozircha mavjud emas.\n"
+        "🎙 Ovozli xabar yuboring yoki 🎬 video link yuboring."
+    )
+
+
+# ========================== DOCUMENT HANDLER ==========================
+@router.message(F.document)
+async def document_handler(message: Message):
+    await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
+    if await db.is_blocked(message.from_user.id):
+        return
+    await db.update_activity(message.from_user.id)
+    lang = await get_lang(message.from_user.id)
+    if not await check_and_force_sub_group(message, lang):
+        return
+    doc = message.document
+    filename = doc.file_name or "Noma'lum fayl"
+    size_mb = doc.file_size / (1024 * 1024) if doc.file_size else 0
+    await message.answer(
+        TEXTS[lang]["document_received"].format(filename=filename, size_mb=f"{size_mb:.1f}")
+    )
+
+# ========================== AUDIO RECOGNITION ==========================
+async def process_audio_recognition(bot: Bot, file_id: str | None, user_id: int, message: Message, is_video: bool = False, local_path: str | None = None):
+    lang = await get_lang(user_id)
+    tmp_path = None
+    recognize_path = None
+
+    loading_msg = await message.answer(TEXTS[lang]["recognizing"])
+
+    try:
+        if local_path and os.path.exists(local_path):
+            tmp_path = local_path
+            ext = local_path.split(".")[-1] if "." in local_path else "mp4"
+        elif file_id:
+            file = await bot.get_file(file_id)
+            ext = file.file_path.split(".")[-1] if "." in file.file_path else "mp3"
+            tmp_path = os.path.join(tempfile.gettempdir(), f"{user_id}_{datetime.now().timestamp():.0f}.{ext}")
+            tmp_path = os.path.normpath(tmp_path)
+            await bot.download_file(file.file_path, tmp_path)
+        else:
+            raise ValueError("Hech qanday fayl ko'rsatilmagan")
+
+        recognize_path = tmp_path
+        if is_video or tmp_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv')):
+            recognize_path = await extract_audio_ffmpeg(tmp_path)
+
+        result = await recognize_with_shazam(recognize_path)
+
+        if tmp_path and tmp_path != local_path:
+            _cleanup_file(tmp_path)
+        if recognize_path and recognize_path != tmp_path and recognize_path != local_path:
+            _cleanup_file(recognize_path)
+
+        if not result:
+            await loading_msg.edit_text(TEXTS[lang]["not_recognized"])
+            return
+
+        title = result.get("title", "Noma'lum")
+        artist = result.get("artist", "Noma'lum")
+        query = f"{artist} {title}".strip()
+
+        youtube_results = await search_music(query, max_results=15)
+
+        await loading_msg.delete()
+
+        if youtube_results:
+            user_search_state[user_id] = {
+                "results": youtube_results,
+                "page": 0,
+                "query": f"🎵 {artist} — {title}",
+                "source": "piped",
+            }
+            text, markup = await build_search_page(user_id, 0)
+            if text:
+                await message.answer(text, reply_markup=markup)
+            return
+
+        if lang == "uz":
+            text = f"🎵 <b>{artist}</b> — <b>{title}</b>\n\n❌ YouTube'da topilmadi.\n🎵 Qo'shiq nomini yozib qidiring."
+        elif lang == "uz_kr":
+            text = f"🎵 <b>{artist}</b> — <b>{title}</b>\n\n❌ YouTube'да топилмади.\n🎵 Қўшиқ номини ёзиб қидиринг."
+        elif lang == "ru":
+            text = f"🎵 <b>{artist}</b> — <b>{title}</b>\n\n❌ Не найдено на YouTube.\n🎵 Напишите название трека для поиска."
+        else:
+            text = f"🎵 <b>{artist}</b> — <b>{title}</b>\n\n❌ Not found on YouTube.\n🎵 Type the track name to search."
+
+        await message.answer(text)
+
+    except Exception as e:
+        if tmp_path and tmp_path != local_path:
+            _cleanup_file(tmp_path)
+        if recognize_path and recognize_path != tmp_path and recognize_path != local_path:
+            _cleanup_file(recognize_path)
+        try:
+            await loading_msg.edit_text(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+        except Exception:
+            await message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+
+
+# ========================== VOICE HANDLER ==========================
+@router.message(F.voice)
+async def voice_handler(message: Message):
+    await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
+    if await db.is_blocked(message.from_user.id):
+        return
+    await db.update_activity(message.from_user.id)
+    lang = await get_lang(message.from_user.id)
+    if not await check_and_force_sub_group(message, lang):
+        return
+
+    try:
+        file = await message.bot.get_file(message.voice.file_id)
+        ext = file.file_path.split(".")[-1] if "." in file.file_path else "ogg"
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{message.from_user.id}_{datetime.now().timestamp():.0f}.{ext}")
+        tmp_path = os.path.normpath(tmp_path)
+        await message.bot.download_file(file.file_path, tmp_path)
+
+        link_download_state[message.from_user.id] = {
+            "path": tmp_path,
+            "title": None,
+        }
+
+        if lang == "uz":
+            caption = "🎙 <b>Ovozli xabar qabul qilindi!</b>\n\n🎵 Musiqani aniqlash uchun tugmani bosing:"
+        elif lang == "uz_kr":
+            caption = "🎙 <b>Овозли хабар қабул қилинди!</b>\n\n🎵 Мусиқани аниқлаш учун тугмани босинг:"
+        elif lang == "ru":
+            caption = "🎙 <b>Голосовое сообщение получено!</b>\n\n🎵 Нажмите кнопку для распознавания музыки:"
+        else:
+            caption = "🎙 <b>Voice message received!</b>\n\n🎵 Press the button to recognize music:"
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🎵 " + ("Musiqani topish" if lang == "uz" else "Мусиқани топиш" if lang == "uz_kr" else "Найти музыку" if lang == "ru" else "Find Music"),
+                callback_data=f"find_music:{message.from_user.id}"
+            )]
+        ])
+
+        await message.answer(caption, reply_markup=kb)
+    except Exception as e:
+        logging.error(f"Voice handler error: {e}")
+        await message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+
+
+# ========================== AUDIO HANDLER ==========================
+@router.message(F.audio)
+async def audio_handler(message: Message):
+    await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
+    if await db.is_blocked(message.from_user.id):
+        return
+    await db.update_activity(message.from_user.id)
+    lang = await get_lang(message.from_user.id)
+    if not await check_and_force_sub_group(message, lang):
+        return
+
+    try:
+        file = await message.bot.get_file(message.audio.file_id)
+        ext = file.file_path.split(".")[-1] if "." in file.file_path else "mp3"
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{message.from_user.id}_{datetime.now().timestamp():.0f}.{ext}")
+        tmp_path = os.path.normpath(tmp_path)
+        await message.bot.download_file(file.file_path, tmp_path)
+
+        link_download_state[message.from_user.id] = {
+            "path": tmp_path,
+            "title": None,
+        }
+
+        if lang == "uz":
+            caption = "🎵 <b>Audio qabul qilindi!</b>\n\n🎵 Musiqani aniqlash uchun tugmani bosing:"
+        elif lang == "uz_kr":
+            caption = "🎵 <b>Аудио қабул қилинди!</b>\n\n🎵 Мусиқани аниқлаш учун тугмани босинг:"
+        elif lang == "ru":
+            caption = "🎵 <b>Аудио получено!</b>\n\n🎵 Нажмите кнопку для распознавания музыки:"
+        else:
+            caption = "🎵 <b>Audio received!</b>\n\n🎵 Press the button to recognize music:"
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🎵 " + ("Musiqani topish" if lang == "uz" else "Мусиқани топиш" if lang == "uz_kr" else "Найти музыку" if lang == "ru" else "Find Music"),
+                callback_data=f"find_music:{message.from_user.id}"
+            )]
+        ])
+
+        await message.answer(caption, reply_markup=kb)
+    except Exception as e:
+        logging.error(f"Audio handler error: {e}")
+        await message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+
+# ========================== VIDEO HANDLER ==========================
+@router.message(F.video)
+async def video_handler(message: Message):
+    await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
+    if await db.is_blocked(message.from_user.id):
+        return
+    await db.update_activity(message.from_user.id)
+    lang = await get_lang(message.from_user.id)
+    if not await check_and_force_sub_group(message, lang):
+        return
+
+    try:
+        file = await message.bot.get_file(message.video.file_id)
+        ext = file.file_path.split(".")[-1] if "." in file.file_path else "mp4"
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{message.from_user.id}_{datetime.now().timestamp():.0f}.{ext}")
+        tmp_path = os.path.normpath(tmp_path)
+        await message.bot.download_file(file.file_path, tmp_path)
+
+        link_download_state[message.from_user.id] = {
+            "path": tmp_path,
+            "title": None,
+        }
+
+        if lang == "uz":
+            caption = "🎬 <b>Video qabul qilindi!</b>\n\n🎵 Musiqani aniqlash uchun tugmani bosing:"
+        elif lang == "uz_kr":
+            caption = "🎬 <b>Видео қабул қилинди!</b>\n\n🎵 Мусиқани аниқлаш учун тугмани босинг:"
+        elif lang == "ru":
+            caption = "🎬 <b>Видео получено!</b>\n\n🎵 Нажмите кнопку для распознавания музыки:"
+        else:
+            caption = "🎬 <b>Video received!</b>\n\n🎵 Press the button to recognize music:"
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🎵 " + ("Musiqani topish" if lang == "uz" else "Мусиқани топиш" if lang == "uz_kr" else "Найти музыку" if lang == "ru" else "Find Music"),
+                callback_data=f"find_music:{message.from_user.id}"
+            )]
+        ])
+
+        await message.answer(caption, reply_markup=kb)
+    except Exception as e:
+        logging.error(f"Video handler error: {e}")
+        await message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+
+
+# ========================== VIDEO NOTE HANDLER ==========================
+@router.message(F.video_note)
+async def video_note_handler(message: Message):
+    await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
+    if await db.is_blocked(message.from_user.id):
+        return
+    await db.update_activity(message.from_user.id)
+    lang = await get_lang(message.from_user.id)
+    if not await check_and_force_sub_group(message, lang):
+        return
+
+    try:
+        file = await message.bot.get_file(message.video_note.file_id)
+        ext = file.file_path.split(".")[-1] if "." in file.file_path else "mp4"
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{message.from_user.id}_{datetime.now().timestamp():.0f}.{ext}")
+        tmp_path = os.path.normpath(tmp_path)
+        await message.bot.download_file(file.file_path, tmp_path)
+
+        link_download_state[message.from_user.id] = {
+            "path": tmp_path,
+            "title": None,
+        }
+
+        if lang == "uz":
+            caption = "🎬 <b>Video note qabul qilindi!</b>\n\n🎵 Musiqani aniqlash uchun tugmani bosing:"
+        elif lang == "uz_kr":
+            caption = "🎬 <b>Видео ноте қабул қилинди!</b>\n\n🎵 Мусиқани аниқлаш учун тугмани босинг:"
+        elif lang == "ru":
+            caption = "🎬 <b>Видео-кружок получен!</b>\n\n🎵 Нажмите кнопку для распознавания музыки:"
+        else:
+            caption = "🎬 <b>Video note received!</b>\n\n🎵 Press the button to recognize music:"
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🎵 " + ("Musiqani topish" if lang == "uz" else "Мусиқани топиш" if lang == "uz_kr" else "Найти музыку" if lang == "ru" else "Find Music"),
+                callback_data=f"find_music:{message.from_user.id}"
+            )]
+        ])
+
+        await message.answer(caption, reply_markup=kb)
+    except Exception as e:
+        logging.error(f"Video note handler error: {e}")
+        await message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+
+
+# ========================== PROFILE ==========================
+@router.callback_query(F.data == "profile")
+async def profile_callback(call: CallbackQuery):
+    user = await db.get_user(call.from_user.id)
+    if not user:
+        return
+    lang = user["language"] or "uz"
+    text = TEXTS[lang]["profile"].format(
+        telegram_id=user["telegram_id"],
+        fullname=user["fullname"] or "Noma'lum",
+        username=f"@{user['username']}" if user["username"] else "yo'q",
+        language=user["language"],
+    )
+    await call.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_main")]]
+        ),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "lang_menu")
+async def lang_menu_callback(call: CallbackQuery):
+    lang = await get_lang(call.from_user.id)
+    await call.message.edit_text(TEXTS[lang]["choose_lang"], reply_markup=lang_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "back_to_main")
+async def back_to_main(call: CallbackQuery):
+    lang = await get_lang(call.from_user.id)
+    await call.message.edit_text(TEXTS[lang]["welcome"], reply_markup=main_menu_kb(lang))
+    await call.answer()
+
+# ========================== ADMIN PANEL ==========================
+@router.message(Command("admin"))
+async def admin_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer(TEXTS["uz"]["admin_welcome"], reply_markup=admin_main_kb())
+
+
+@router.callback_query(F.data.startswith("admin:"))
+async def admin_callbacks(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("❌", show_alert=True)
+        return
+
+    parts = call.data.split(":")
+    action = parts[1]
+
+    if action == "back":
+        await call.message.edit_text(TEXTS["uz"]["admin_welcome"], reply_markup=admin_main_kb())
+
+    elif action == "close":
+        await call.message.delete()
+
+    elif action == "stats":
+        total, active, week, top = await db.get_stats()
+        lang_stats = await db.get_language_stats()
+        langs_text = "\n".join([f"• {row['language']}: {row['c']}" for row in lang_stats]) or "Ma'lumot yo'q"
+        top_text = "\n".join([f"{i+1}. {row['query']} ({row['c']} marta)" for i, row in enumerate(top)]) or "Ma'lumot yo'q"
+        text = TEXTS["uz"]["stats"].format(total=total, active=active, week=week, langs=langs_text, top=top_text)
+        await call.message.edit_text(text, reply_markup=admin_back_kb())
+
+    elif action == "channels":
+        channels = await db.get_channels()
+        if not channels:
+            text = "📢 <b>Majburiy obuna kanallari:</b>\n\nKanallar yo'q."
+        else:
+            text = "📢 <b>Majburiy obuna kanallari:</b>\n\nBirini o'chirish uchun bosing:"
+        await call.message.edit_text(text, reply_markup=channels_kb(channels))
+
+    elif action == "ch_add":
+        await call.message.edit_text(TEXTS["uz"]["enter_channel"])
+        admin_state[call.from_user.id] = {"state": "waiting_channel"}
+
+    elif action == "ch_del" and len(parts) == 3:
+        username = parts[2]
+        await db.remove_channel(username)
+        await call.answer("❌ O'chirildi", show_alert=True)
+        channels = await db.get_channels()
+        text = "📢 <b>Majburiy obuna kanallari:</b>\n\nBirini o'chirish uchun bosing:"
+        await call.message.edit_text(text, reply_markup=channels_kb(channels))
+
+    elif action == "broadcast":
+        await call.message.edit_text(
+            "📨 <b>Reklama (Broadcast)</b>\n\nQanday xabar yuborishni tanlang:",
+            reply_markup=broadcast_kb(),
+        )
+
+    elif action == "bc_text":
+        await call.message.edit_text(TEXTS["uz"]["broadcast_ask_text"])
+        admin_state[call.from_user.id] = {"state": "waiting_broadcast_text"}
+
+    elif action == "bc_media":
+        await call.message.edit_text(TEXTS["uz"]["broadcast_ask_media"])
+        admin_state[call.from_user.id] = {"state": "waiting_broadcast_media"}
+
+    elif action == "bc_skip":
+        media_msg = admin_state.get(call.from_user.id, {}).get("media_msg")
+        admin_state.pop(call.from_user.id, None)
+        if media_msg:
+            count = await broadcast_to_all(call.bot, media_msg)
+            await call.message.answer(TEXTS["uz"]["broadcast_done"].format(count=count))
+        else:
+            await call.message.answer("❌ Media topilmadi.")
+        await call.message.answer(TEXTS["uz"]["admin_welcome"], reply_markup=admin_main_kb())
+
+    elif action == "blacklist":
+        blocked = await db.get_blocked_users()
+        if not blocked:
+            text = "🚫 <b>Blacklist</b>\n\n" + TEXTS["uz"]["no_blocked"]
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Block qilish", callback_data="admin:block_add")],
+                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:back")],
+            ])
+            await call.message.edit_text(text, reply_markup=kb)
+        else:
+            text = "🚫 <b>Bloklangan foydalanuvchilar:</b>\n\nBlokdan ochish uchun bosing:"
+            await call.message.edit_text(text, reply_markup=blacklist_kb(blocked))
+
+    elif action == "block_add":
+        await call.message.edit_text(TEXTS["uz"]["enter_block_id"])
+        admin_state[call.from_user.id] = {"state": "waiting_block_id"}
+
+    elif action == "unblock" and len(parts) == 3:
+        target_id = int(parts[2])
+        await db.unblock_user(target_id)
+        await call.answer("✅ Blokdan ochirildi", show_alert=True)
+        blocked = await db.get_blocked_users()
+        if not blocked:
+            text = "🚫 <b>Blacklist</b>\n\n" + TEXTS["uz"]["no_blocked"]
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Block qilish", callback_data="admin:block_add")],
+                [InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:back")],
+            ])
+            await call.message.edit_text(text, reply_markup=kb)
+        else:
+            text = "🚫 <b>Bloklangan foydalanuvchilar:</b>\n\nBlokdan ochish uchun bosing:"
+            await call.message.edit_text(text, reply_markup=blacklist_kb(blocked))
+
+    elif action == "groups":
+        groups = await db.get_groups()
+        if groups:
+            groups_text = "\n".join([f"• {g['title']} (<code>{g['group_id']}</code>)" for g in groups])
+        else:
+            groups_text = TEXTS["uz"]["no_groups"]
+        text = TEXTS["uz"]["groups_list"].format(groups=groups_text)
+        await call.message.edit_text(text, reply_markup=admin_back_kb())
+
+    elif action == "langs":
+        lang_stats = await db.get_language_stats()
+        if lang_stats:
+            stats_text = "\n".join([f"• {row['language']}: {row['c']} ta" for row in lang_stats])
+        else:
+            stats_text = "Ma'lumot yo'q"
+        text = TEXTS["uz"]["lang_stats"].format(stats=stats_text)
+        await call.message.edit_text(text, reply_markup=admin_back_kb())
+
+    await call.answer()
+
+# ========================== GROUP TRACKING ==========================
+@router.my_chat_member()
+async def my_chat_member_handler(update: ChatMemberUpdated):
+    if update.new_chat_member and update.new_chat_member.status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+    ):
+        await db.add_group(update.chat.id, update.chat.title or "Noma'lum")
+
+
+# ========================== UNKNOWN MESSAGE HANDLER ==========================
+@router.message()
+async def unknown_message_handler(message: Message):
+    await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
+    if await db.is_blocked(message.from_user.id):
+        return
+    await db.update_activity(message.from_user.id)
+    lang = await get_lang(message.from_user.id)
+    if not await check_and_force_sub_group(message, lang):
+        return
+    await message.answer(TEXTS[lang]["unknown_message"])
+
+
+# ========================== GLOBAL ERROR HANDLER ==========================
+@router.errors()
+async def global_error_handler(event):
+    logging.error(f"Global error: {event.exception}", exc_info=True)
+    if hasattr(event, 'update') and event.update and hasattr(event.update, 'message') and event.update.message:
+        try:
+            lang = await get_lang(event.update.message.from_user.id)
+            await event.update.message.answer(
+                TEXTS[lang]["download_error"].format(error="Kutilmagan xatolik yuz berdi. Iltimos, keyinroq urinib ko'ring.")
+            )
+        except Exception:
+            pass
+
+
+# ========================== MAIN ==========================
+async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    if BOT_TOKEN in ("", "YOUR_BOT_TOKEN_HERE"):
+        print("[XATOLIK] BOT_TOKEN sozlanmagan!")
+        return
+
+    global db
+    db = Database(DATABASE_URL)
+    await db.connect()
+    print("[OK] PostgreSQL bazaga ulanish o'rnatildi.")
+
+    ffmpeg_cmd = find_ffmpeg_cmd()
+    if not ffmpeg_cmd:
+        print("[WARN] FFmpeg topilmadi! Videodan musiqa ajratish ishlamaydi.")
+    else:
+        print(f"[OK] FFmpeg topildi: {ffmpeg_cmd}")
+
+    if shazam_client is None:
+        print("[WARN] ShazamIO o'rnatilmagan. Ovozli xabar aniqlash ishlamaydi.")
+        if sys.version_info >= (3, 13):
+            print("[WARN] Python 3.13+. ShazamIO ishlamasligi mumkin. Python 3.12 ishlatishni tavsiya qilamiz.")
+    else:
+        print("[OK] ShazamIO tayyor.")
+
+    print("[INFO] Piped/Invidious API orqali musiqa qidirish va yuklash ishlatiladi.")
+    print("[INFO] yt-dlp o'rniga faqat HTTP requests ishlatiladi.")
+
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    print("[OK] Bot ishga tushmoqda...")
+
+    for attempt in range(3):
+        try:
+            info = await bot.get_webhook_info()
+            if info.url:
+                print(f"[INFO] Webhook o'chirilmoqda (attempt {attempt + 1})...")
+                await bot.delete_webhook(drop_pending_updates=True)
+            break
+        except Exception as e:
+            print(f"[WARN] Webhook cleanup attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(1)
+
+    await asyncio.sleep(2)
+
+    try:
+        print("[INFO] Polling boshlanyapti...")
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    except TelegramConflictError as e:
+        print(f"[ERROR] Telegram conflict: {e}. Bitta bot instansiyasi ishlayotganini tekshiring.")
+    except TelegramNetworkError as e:
+        print(f"[ERROR] Telegram network error: {e}")
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
