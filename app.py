@@ -9,13 +9,16 @@ import shutil
 import hashlib
 import base64
 import html
+import json
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 import dotenv
 from dotenv import load_dotenv
 load_dotenv()
 import aiohttp
 import asyncpg
+import yt_dlp
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
     Message, CallbackQuery, ChatMemberUpdated,
@@ -66,27 +69,18 @@ BOT_USERNAME = "skachatinstavideo_bot"
 # ========================== PIPED / INVIDIOUS SERVERS ==========================
 PIPED_SERVERS = [
     "https://pipedapi.kavin.rocks",
-    "https://pipedapi-libre.kavin.rocks",
-    "https://pipedapi.leptons.xyz",
-    "https://piped-api.privacy.com.de",
+    "https://api.piped.moomoo.me",
     "https://pipedapi.adminforge.de",
-    "https://api.piped.yt",
-    "https://pipedapi.drgns.space",
-    "https://pipedapi.owo.si",
-    "https://pipedapi.ducks.party",
-    "https://piped-api.codespace.cz",
-    "https://pipedapi.reallyaweso.me",
-    "https://api.piped.private.coffee",
-    "https://pipedapi.darkness.services",
+    "https://pipedapi.p.projectsegfault.com",
+    "https://pipedapi.privacydev.net",
+    "https://pipedapi.palveluntarjoaja.eu",
 ]
 
 INVIDIOUS_SERVERS = [
-    "https://inv.nadeko.net",
-    "https://invidious.nerdvpn.de",
-    "https://inv.thepixora.com",
-    "https://yt.chocolatemoo53.com",
-    "https://invidious.tiekoetter.com",
-    "https://invidious.f5.si",
+    "https://vid.puffyan.us",
+    "https://y.com.sb",
+    "https://iv.nboeck.de",
+    "https://invidious.perennialte.ch",
 ]
 
 # ========================== UNIFIED COOKIE HELPER ==========================
@@ -94,31 +88,16 @@ COOKIE_FILE = os.path.join(os.getcwd(), "cookies.txt")
 
 
 def get_cookiefile() -> str | None:
-    """Agar cookies.txt mavjud bo'lsa, yo'lini qaytaradi, aks holda None."""
+    """Agar cookies.txt mavjud bo'lsa, yo'lini qaytaradi."""
     if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 100:
-        try:
-            with open(COOKIE_FILE, 'r', encoding='utf-8') as f:
-                cookie_content = f.read()
-
-            has_youtube = '.youtube.com' in cookie_content
-            has_youtube_login = 'LOGIN_INFO' in cookie_content or 'SID' in cookie_content
-            has_instagram = '.instagram.com' in cookie_content
-            has_instagram_session = 'sessionid' in cookie_content.lower()
-
-            if has_instagram and not has_youtube and not has_instagram_session:
-                return None
-            if has_youtube and not has_youtube_login:
-                return None
-            return COOKIE_FILE
-        except Exception:
-            return COOKIE_FILE
+        return COOKIE_FILE
     return None
 
 
 def normalize_search_query(query: str) -> str:
     """Musiqa qidiruv so'rovini tozalash."""
     query = query or ""
-    query = re.sub(r'[_\-\.+]+', ' ', query)
+    query = re.sub(r'[_\-\.\+]+', ' ', query)
     query = re.sub(
         r'\b(?:mp4|webm|mkv|mov|m4v|jpg|jpeg|png|webp|video|audio|download|instagram|insta|reel|tv|post)\b',
         ' ',
@@ -137,266 +116,252 @@ def build_query_from_filename(filename: str) -> str | None:
     return base_name if len(base_name) >= 3 else None
 
 
-# ========================== PIPED API HELPERS ==========================
-async def piped_search(query: str, max_results: int = 15) -> list:
-    """Piped API orqali YouTube'dan musiqa qidirish."""
-    results = []
+# ========================== PIPED / INVIDIOUS API ==========================
+async def search_piped_tracks(query: str, max_results: int = 15) -> list:
+    """Piped API orqali musiqa qidirish."""
     for server in PIPED_SERVERS:
         try:
-            url = f"{server}/search"
-            params = {"q": query, "filter": "music_songs"}
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if isinstance(data, list):
-                            for item in data[:max_results]:
-                                if item.get("url", "").startswith("/watch?v="):
-                                    video_id = item["url"].replace("/watch?v=", "")
-                                    results.append({
-                                        "id": video_id,
-                                        "title": item.get("title", "Noma'lum"),
-                                        "uploader": item.get("uploader", "—"),
-                                        "duration": item.get("duration", 0),
-                                        "url": f"https://www.youtube.com/watch?v={video_id}",
-                                        "thumbnail": item.get("thumbnail", ""),
-                                    })
-                            if results:
-                                return results
+            async with aiohttp.ClientSession() as session:
+                params = {"q": query, "filter": "music_songs"}
+                async with session.get(f"{server}/search", params=params, timeout=15) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    items = data.get("items", [])
+                    results = []
+                    for item in items[:max_results]:
+                        video_url = item.get("url", "")
+                        video_id = ""
+                        if "v=" in video_url:
+                            video_id = video_url.split("v=")[-1].split("&")[0]
+                        elif "/watch/" in video_url:
+                            video_id = video_url.split("/watch/")[-1].split("?")[0]
+                        else:
+                            video_id = video_url.strip("/").split("/")[-1]
+                        
+                        results.append({
+                            "id": video_id,
+                            "title": item.get("title", "Noma'lum"),
+                            "uploader": item.get("uploaderName", "Noma'lum"),
+                            "duration": item.get("duration", 0),
+                            "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else video_url,
+                            "thumbnail": item.get("thumbnail", ""),
+                        })
+                    if results:
+                        logging.info(f"[Piped] {len(results)} natija topildi ({server})")
+                        return results
         except Exception as e:
-            logging.warning(f"[Piped] {server} xatolik: {e}")
-            continue
-    return results
+            logging.warning(f"Piped search xatosi ({server}): {e}")
+    return []
 
 
-async def piped_get_streams(video_id: str) -> dict | None:
-    """Piped API orqali video stream ma'lumotlarini olish."""
+async def search_invidious_tracks(query: str, max_results: int = 15) -> list:
+    """Invidious API orqali musiqa qidirish (fallback)."""
+    for server in INVIDIOUS_SERVERS:
+        try:
+            async with aiohttp.ClientSession() as session:
+                params = {"q": query}
+                async with session.get(f"{server}/api/v1/search", params=params, timeout=15) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    results = []
+                    for item in data[:max_results]:
+                        if item.get("type") != "video":
+                            continue
+                        vid = item.get("videoId", "")
+                        results.append({
+                            "id": vid,
+                            "title": item.get("title", "Noma'lum"),
+                            "uploader": item.get("author", "Noma'lum"),
+                            "duration": item.get("lengthSeconds", 0),
+                            "url": f"https://www.youtube.com/watch?v={vid}",
+                            "thumbnail": item.get("videoThumbnails", [{}])[0].get("url", "") if item.get("videoThumbnails") else "",
+                        })
+                    if results:
+                        logging.info(f"[Invidious] {len(results)} natija topildi ({server})")
+                        return results
+        except Exception as e:
+            logging.warning(f"Invidious search xatosi ({server}): {e}")
+    return []
+
+
+async def get_piped_streams(video_id: str) -> dict | None:
+    """Piped dan stream ma'lumotlarini olish."""
     for server in PIPED_SERVERS:
         try:
-            url = f"{server}/streams/{video_id}"
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-                async with session.get(url) as resp:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{server}/streams/{video_id}", timeout=15) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        if data and "audioStreams" in data:
-                            return data
+                        return await resp.json()
         except Exception as e:
-            logging.warning(f"[Piped Streams] {server} xatolik: {e}")
-            continue
+            logging.warning(f"Piped streams xatosi ({server}): {e}")
     return None
 
 
-async def piped_download_audio(video_id: str, output_path: str) -> str | None:
-    """Piped API orqali audio stream URL ni olib, yuklab olish."""
-    stream_data = await piped_get_streams(video_id)
-    if not stream_data:
-        return None
+async def get_invidious_streams(video_id: str) -> dict | None:
+    """Invidious dan stream ma'lumotlarini olish."""
+    for server in INVIDIOUS_SERVERS:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{server}/api/v1/videos/{video_id}", timeout=15) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+        except Exception as e:
+            logging.warning(f"Invidious streams xatosi ({server}): {e}")
+    return None
 
-    audio_streams = stream_data.get("audioStreams", [])
+
+async def download_piped_audio(video_id: str, output_dir: str, filename_base: str) -> str | None:
+    """Piped dan eng yaxshi audio stream ni yuklab olish."""
+    streams = await get_piped_streams(video_id)
+    if not streams:
+        return None
+    
+    audio_streams = streams.get("audioStreams", [])
     if not audio_streams:
         return None
-
-    # Eng yaxshi audio stream ni tanlash (bitrate bo'yicha)
-    best_audio = max(audio_streams, key=lambda x: x.get("bitrate", 0))
-    audio_url = best_audio.get("url")
-    if not audio_url:
-        return None
-
-    # Piped audio URL lari odatda GoogleVideo (googlevideo.com) dan keladi
-    # Ba'zi serverlar uchun Referer header kerak bo'lishi mumkin
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://piped.video/",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
+    
+    best = max(audio_streams, key=lambda x: x.get("bitrate", 0))
+    audio_url = best.get("url")
+    mime = best.get("mimeType", "")
+    
+    if "mp4" in mime or "m4a" in mime:
+        ext = "m4a"
+    elif "webm" in mime:
+        ext = "webm"
+    else:
+        ext = "m4a"
+    
+    output_path = os.path.join(output_dir, f"{filename_base}.{ext}")
+    
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
-            async with session.get(audio_url, headers=headers) as resp:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(audio_url, timeout=120) as resp:
                 if resp.status == 200:
                     with open(output_path, 'wb') as f:
                         async for chunk in resp.content.iter_chunked(8192):
                             f.write(chunk)
                     if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
                         return output_path
-                else:
-                    logging.warning(f"[Piped Download] HTTP {resp.status}: {audio_url[:100]}")
     except Exception as e:
-        logging.warning(f"[Piped Download] Audio yuklashda xatolik: {e}")
-    return None
+        logging.error(f"Piped audio yuklash xatosi: {e}")
+    
+    # Fallback Invidious
+    return await download_invidious_audio(video_id, output_dir, filename_base)
 
 
-# ========================== INVIDIOUS API HELPERS (FALLBACK) ==========================
-async def invidious_search(query: str, max_results: int = 15) -> list:
-    """Invidious API orqali YouTube'dan musiqa qidirish (fallback)."""
-    results = []
-    for server in INVIDIOUS_SERVERS:
-        try:
-            url = f"{server}/api/v1/search"
-            params = {"q": query, "type": "video"}
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if isinstance(data, list):
-                            for item in data[:max_results]:
-                                if item.get("type") == "video":
-                                    video_id = item.get("videoId", "")
-                                    if video_id:
-                                        results.append({
-                                            "id": video_id,
-                                            "title": item.get("title", "Noma'lum"),
-                                            "uploader": item.get("author", "—"),
-                                            "duration": item.get("lengthSeconds", 0),
-                                            "url": f"https://www.youtube.com/watch?v={video_id}",
-                                            "thumbnail": item.get("videoThumbnails", [{}])[0].get("url", "") if item.get("videoThumbnails") else "",
-                                        })
-                            if results:
-                                return results
-        except Exception as e:
-            logging.warning(f"[Invidious] {server} xatolik: {e}")
-            continue
-    return results
-
-
-async def invidious_get_audio_url(video_id: str) -> str | None:
-    """Invidious API orqali audio stream URL olish."""
-    for server in INVIDIOUS_SERVERS:
-        try:
-            url = f"{server}/api/v1/videos/{video_id}"
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        adaptive = data.get("adaptiveFormats", [])
-                        audio_formats = [f for f in adaptive if f.get("type", "").startswith("audio/")]
-                        if audio_formats:
-                            best = max(audio_formats, key=lambda x: x.get("bitrate", 0))
-                            return best.get("url")
-                        # formatStreams dan audio qidirish
-                        formats = data.get("formatStreams", [])
-                        for f in formats:
-                            if f.get("type", "").startswith("audio/"):
-                                return f.get("url")
-        except Exception as e:
-            logging.warning(f"[Invidious Streams] {server} xatolik: {e}")
-            continue
-    return None
-
-
-async def invidious_download_audio(video_id: str, output_path: str) -> str | None:
-    """Invidious API orqali audio yuklash."""
-    audio_url = await invidious_get_audio_url(video_id)
-    if not audio_url:
+async def download_invidious_audio(video_id: str, output_dir: str, filename_base: str) -> str | None:
+    """Invidious dan audio yuklash (fallback)."""
+    streams = await get_invidious_streams(video_id)
+    if not streams:
         return None
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://invidious.io/",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
+    
+    formats = streams.get("adaptiveFormats", [])
+    audio_formats = [f for f in formats if f.get("type", "").startswith("audio/")]
+    if not audio_formats:
+        formats = streams.get("formatStreams", [])
+        audio_formats = [f for f in formats if f.get("type", "").startswith("audio/")]
+    
+    if not audio_formats:
+        return None
+    
+    best = max(audio_formats, key=lambda x: x.get("bitrate", 0) or 0)
+    audio_url = best.get("url")
+    mime = best.get("type", "")
+    
+    if "mp4" in mime:
+        ext = "m4a"
+    elif "webm" in mime:
+        ext = "webm"
+    else:
+        ext = "m4a"
+    
+    output_path = os.path.join(output_dir, f"{filename_base}.{ext}")
+    
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
-            async with session.get(audio_url, headers=headers) as resp:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(audio_url, timeout=120) as resp:
                 if resp.status == 200:
                     with open(output_path, 'wb') as f:
                         async for chunk in resp.content.iter_chunked(8192):
                             f.write(chunk)
                     if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
                         return output_path
-                else:
-                    logging.warning(f"[Invidious Download] HTTP {resp.status}: {audio_url[:100]}")
     except Exception as e:
-        logging.warning(f"[Invidious Download] Audio yuklashda xatolik: {e}")
+        logging.error(f"Invidious audio yuklash xatosi: {e}")
     return None
 
 
-# ========================== UNIFIED SEARCH & DOWNLOAD ==========================
-async def search_music(query: str, max_results: int = 15) -> list:
-    """Piped -> Invidious fallback orqali musiqa qidirish."""
-    # 1. Piped API
-    results = await piped_search(query, max_results)
-    if results:
-        return results
-    # 2. Invidious API fallback
-    logging.info("[Search] Piped ishlamadi, Invidious ga o'tish...")
-    results = await invidious_search(query, max_results)
-    return results
+async def download_piped_video(video_id: str, output_path: str) -> str | None:
+    """Piped dan video yuklash."""
+    for server in PIPED_SERVERS:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{server}/streams/{video_id}", timeout=15) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    video_streams = data.get("videoStreams", [])
+                    if not video_streams:
+                        continue
+                    
+                    mp4_streams = [s for s in video_streams if s.get("format") == "MPEG_4" or "mp4" in s.get("url", "")]
+                    if mp4_streams:
+                        best = max(mp4_streams, key=lambda x: x.get("quality", 0))
+                    else:
+                        best = max(video_streams, key=lambda x: x.get("quality", 0))
+                    
+                    video_url = best.get("url")
+                    if not video_url:
+                        continue
+                    
+                    async with session.get(video_url, timeout=120) as dl_resp:
+                        if dl_resp.status == 200:
+                            with open(output_path, 'wb') as f:
+                                async for chunk in dl_resp.content.iter_chunked(8192):
+                                    f.write(chunk)
+                            if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                                return output_path
+        except Exception as e:
+            logging.warning(f"Piped video yuklash xatosi ({server}): {e}")
+    return None
 
 
-async def download_audio(video_id: str, output_path: str) -> str | None:
-    """Piped -> Invidious fallback orqali audio yuklash."""
-    # 1. Piped API
-    result = await piped_download_audio(video_id, output_path)
-    if result:
-        return result
-    # 2. Invidious API fallback
-    logging.info("[Download] Piped ishlamadi, Invidious ga o'tish...")
-    result = await invidious_download_audio(video_id, output_path)
-    if result:
-        return result
-    # 3. YouTube embeddan audio olish (oxirgi fallback)
-    logging.info("[Download] Invidious ham ishlamadi, YouTube embed ga o'tish...")
-    result = await _youtube_embed_audio(video_id, output_path)
-    return result
-
-
-async def _youtube_embed_audio(video_id: str, output_path: str) -> str | None:
-    """YouTube embed sahifasidan audio URL olish (fallback)."""
-    try:
-        import urllib.request
-        import ssl
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        embed_url = f"https://www.youtube.com/embed/{video_id}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-        }
-        req = urllib.request.Request(embed_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
-            html = response.read().decode('utf-8', errors='ignore')
-
-        # ytInitialPlayerResponse ni qidirish
-        import re
-        match = re.search(r'ytInitialPlayerResponse\\s*=\\s*(\\{.+?\\});', html, re.S)
-        if match:
-            import json
-            data = json.loads(match.group(1))
-            streaming = data.get('streamingData', {})
-
-            # Adaptive formats dan audio ni olish
-            adaptive = streaming.get('adaptiveFormats', [])
-            audio_formats = [f for f in adaptive if f.get('mimeType', '').startswith('audio/')]
-
-            if audio_formats:
-                # Eng yaxshi bitrate ni tanlash
-                best = max(audio_formats, key=lambda x: x.get('bitrate', 0))
-                audio_url = best.get('url')
-                if audio_url:
-                    req_audio = urllib.request.Request(audio_url, headers={
-                        'User-Agent': headers['User-Agent'],
-                        'Referer': 'https://www.youtube.com/',
-                        'Accept': '*/*',
-                    })
-                    with urllib.request.urlopen(req_audio, timeout=120, context=ctx) as resp:
-                        with open(output_path, 'wb') as f:
-                            f.write(resp.read())
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                        return output_path
-    except Exception as e:
-        logging.warning(f"[YouTube Embed] Audio yuklashda xatolik: {e}")
+async def download_invidious_video(video_id: str, output_path: str) -> str | None:
+    """Invidious dan video yuklash (fallback)."""
+    for server in INVIDIOUS_SERVERS:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{server}/api/v1/videos/{video_id}", timeout=15) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    formats = data.get("formatStreams", []) or data.get("adaptiveFormats", [])
+                    video_formats = [f for f in formats if f.get("type", "").startswith("video/")]
+                    if not video_formats:
+                        continue
+                    
+                    best = max(video_formats, key=lambda x: x.get("bitrate", 0) or x.get("quality", 0) or 0)
+                    video_url = best.get("url")
+                    if not video_url:
+                        continue
+                    
+                    async with session.get(video_url, timeout=120) as dl_resp:
+                        if dl_resp.status == 200:
+                            with open(output_path, 'wb') as f:
+                                async for chunk in dl_resp.content.iter_chunked(8192):
+                                    f.write(chunk)
+                            if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                                return output_path
+        except Exception as e:
+            logging.warning(f"Invidious video yuklash xatosi ({server}): {e}")
     return None
 
 
 # ========================== HELPERS ==========================
 def build_share_kb() -> InlineKeyboardMarkup:
+    """Faqat guruhga qo'shish knopkasi"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
@@ -408,6 +373,7 @@ def build_share_kb() -> InlineKeyboardMarkup:
 
 
 def build_video_kb(user_id: int, lang: str) -> InlineKeyboardMarkup:
+    """Video uchun: Qo'shiqni yuklab olish + Guruhga qo'shish"""
     if lang == "uz_kr":
         dl_text = "🎵 Қўшиқни юклаб олиш"
     elif lang == "ru":
@@ -461,13 +427,26 @@ async def check_subscriptions(bot: Bot, user_id: int, channels: list) -> bool:
     return True
 
 
-# ========================== INSTAGRAM DOWNLOADERS (SAQLANDI) ==========================
+async def search_youtube_tracks(query: str, max_results: int = 15) -> list:
+    """Piped/Invidious orqali qo'shiqlarni qidiradi (cookies/proxy kerak emas)."""
+    # 1. Piped
+    results = await search_piped_tracks(query, max_results)
+    if results:
+        return results
+    # 2. Invidious fallback
+    return await search_invidious_tracks(query, max_results)
+
+
+# ========================== INSTAGRAM DOWNLOADERS ==========================
 async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any] | None]:
+    """
+    FIXED Instagram post yuklash - video va rasmni to'g'ri aniqlash bilan
+    """
     def _download():
         import urllib.request
         import ssl
-        import json
 
+        # Post ID ajratib olish
         post_id = None
         patterns = [
             r'instagram\.com/(?:p|reel|tv|share)/([^/?#]+)',
@@ -482,13 +461,16 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                 break
 
         if not post_id:
+            logging.warning(f"[Instagram] Post ID ajratib olinmadi: {url}")
             return None, None
+
+        logging.info(f"[Instagram] Post ID: {post_id}")
 
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        # Embed sahifa
+        # ========== USUL 1: Embed sahifa ==========
         try:
             embed_url = f"https://www.instagram.com/p/{post_id}/embed/captioned/"
             headers = {
@@ -497,16 +479,20 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Referer': 'https://www.instagram.com/',
             }
+
             req = urllib.request.Request(embed_url, headers=headers)
             with urllib.request.urlopen(req, timeout=20, context=ctx) as response:
-                html_text = response.read().decode('utf-8')
+                html = response.read().decode('utf-8')
+
+            logging.info(f"[Instagram] Embed sahifa yuklandi. Uzunlik: {len(html)}")
 
             media_url = None
             is_video = False
             title = None
             thumbnail_url = None
 
-            ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html_text, flags=re.S)
+            # 1. JSON-LD dan olish
+            ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html, flags=re.S)
             if ld_json:
                 try:
                     ld_data = json.loads(ld_json.group(1))
@@ -514,31 +500,39 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                         if 'video' in ld_data and isinstance(ld_data['video'], dict):
                             media_url = ld_data['video'].get('contentUrl')
                             is_video = True
+                            logging.info(f"[Instagram] JSON-LD video URL: {media_url[:80] if media_url else 'None'}...")
                         elif 'image' in ld_data and isinstance(ld_data['image'], str):
                             thumbnail_url = ld_data['image']
+                            logging.info(f"[Instagram] JSON-LD image URL: {thumbnail_url[:80] if thumbnail_url else 'None'}...")
                         if 'caption' in ld_data:
                             title = ld_data['caption']
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.warning(f"[Instagram] JSON-LD parse xatolik: {e}")
 
+            # 2. og:video dan olish
             if not media_url:
-                og_video = re.search(r'<meta[^>]+property="og:video"[^>]+content="(https://[^"]+)"', html_text)
+                og_video = re.search(r'<meta[^>]+property="og:video"[^>]+content="(https://[^"]+)"', html)
                 if og_video:
                     media_url = og_video.group(1)
                     is_video = True
+                    logging.info(f"[Instagram] og:video topildi: {media_url[:80]}...")
 
+            # 3. og:video:secure_url
             if not media_url:
-                og_video_secure = re.search(r'<meta[^>]+property="og:video:secure_url"[^>]+content="(https://[^"]+)"', html_text)
+                og_video_secure = re.search(r'<meta[^>]+property="og:video:secure_url"[^>]+content="(https://[^"]+)"', html)
                 if og_video_secure:
                     media_url = og_video_secure.group(1)
                     is_video = True
 
+            # 4. video tag
             if not media_url:
-                video_matches = re.findall(r'<video[^>]+(?:src|data-src)="(https://[^"]+)"', html_text)
+                video_matches = re.findall(r'<video[^>]+(?:src|data-src)="(https://[^"]+)"', html)
                 if video_matches:
                     media_url = video_matches[0]
                     is_video = True
+                    logging.info(f"[Instagram] video tag dan topildi: {media_url[:80]}...")
 
+            # 5. JS orqali video URL
             if not media_url:
                 video_url_patterns = [
                     r'"video_url":"(https://[^"]+\.mp4[^"]*)"',
@@ -546,20 +540,25 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                     r'src="(https://[^"]+instagram\.com[^"]+\.mp4[^"]*)"',
                 ]
                 for pattern in video_url_patterns:
-                    match = re.search(pattern, html_text)
+                    match = re.search(pattern, html)
                     if match:
-                        media_url = match.group(1).replace('\\u0026', '&')
+                        media_url = match.group(1).replace('\u0026', '&')
                         is_video = True
+                        logging.info(f"[Instagram] JS video URL topildi: {media_url[:80]}...")
                         break
 
+            # 6. Thumbnail (agar video topilmasa)
             if not media_url and not thumbnail_url:
-                og_match = re.search(r'<meta[^>]+property="og:image"[^>]+content="(https://[^"]+scontent[^"]+)"', html_text)
+                og_match = re.search(r'<meta[^>]+property="og:image"[^>]+content="(https://[^"]+scontent[^"]+)"', html)
                 if og_match:
                     thumbnail_url = og_match.group(1)
+                    logging.info(f"[Instagram] og:image topildi (thumbnail): {thumbnail_url[:80]}...")
 
+            # ========== VIDEO YUKLASH ==========
             if media_url and is_video:
-                media_url = media_url.replace('\\u0026', '&').replace('&amp;', '&')
+                media_url = media_url.replace('\u0026', '&').replace('&amp;', '&')
                 output_path = os.path.join(tempfile.gettempdir(), f"ig_embed_{post_id}.mp4")
+
                 req_media = urllib.request.Request(media_url, headers={
                     'User-Agent': headers['User-Agent'],
                     'Referer': 'https://www.instagram.com/',
@@ -568,24 +567,38 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                 with urllib.request.urlopen(req_media, timeout=30, context=ctx) as response:
                     with open(output_path, 'wb') as f:
                         f.write(response.read())
+
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                    file_size = os.path.getsize(output_path)
+                    logging.info(f"[Instagram] Fayl yuklandi: {file_size} bytes ({file_size/1024:.1f} KB)")
+
                     with open(output_path, 'rb') as f_check:
                         header = f_check.read(12)
+
+                    is_real_video = (
+                        header.startswith(b'\x00\x00\x00') and b'ftyp' in header[:20]
+                    ) or b'ftypmp42' in header[:20]
+
                     is_image = header.startswith(b'\xff\xd8\xff') or header.startswith(b'\x89PNG')
+
                     if is_image:
+                        logging.warning(f"[Instagram] Fayl rasm ekan, video emas. Thumbnail sifatida ishlatiladi.")
                         new_path = output_path.rsplit('.', 1)[0] + '.jpg'
                         os.rename(output_path, new_path)
                         return new_path, {"title": title or f"Instagram {post_id}", "is_video": False}
-                    is_real_video = (header.startswith(b'\x00\x00\x00') and b'ftyp' in header[:20]) or b'ftypmp42' in header[:20]
-                    if not is_real_video and os.path.getsize(output_path) < 1024 * 1024:
+
+                    if not is_real_video and file_size < 1024 * 1024:
+                        logging.warning(f"[Instagram] Fayl juda kichik va video emas. Boshqa usulga o'tish...")
                         os.remove(output_path)
                         media_url = None
                     else:
                         return output_path, {"title": title or f"Instagram {post_id}", "is_video": True}
 
+            # ========== RASM YUKLASH ==========
             if thumbnail_url and not media_url:
-                thumbnail_url = thumbnail_url.replace('\\u0026', '&').replace('&amp;', '&')
+                thumbnail_url = thumbnail_url.replace('\u0026', '&').replace('&amp;', '&')
                 output_path = os.path.join(tempfile.gettempdir(), f"ig_embed_{post_id}.jpg")
+
                 req_img = urllib.request.Request(thumbnail_url, headers={
                     'User-Agent': headers['User-Agent'],
                     'Referer': 'https://www.instagram.com/',
@@ -593,12 +606,15 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                 with urllib.request.urlopen(req_img, timeout=30, context=ctx) as response:
                     with open(output_path, 'wb') as f:
                         f.write(response.read())
+
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                    logging.info(f"[Instagram] Rasm yuklandi (video o'rniga)")
                     return output_path, {"title": title or f"Instagram {post_id}", "is_video": False}
+
         except Exception as e:
             logging.warning(f"[Instagram] Embed usuli xatolik: {e}")
 
-        # Post sahifasi
+        # ========== USUL 2: Post sahifasi ==========
         try:
             post_url = f"https://www.instagram.com/p/{post_id}/"
             headers = {
@@ -607,13 +623,15 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Referer': 'https://www.instagram.com/',
             }
+
             req = urllib.request.Request(post_url, headers=headers)
             with urllib.request.urlopen(req, timeout=20, context=ctx) as response:
-                html_text = response.read().decode('utf-8', errors='ignore')
+                html = response.read().decode('utf-8', errors='ignore')
 
             media_url = None
             is_video = False
-            ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html_text, flags=re.S)
+
+            ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html, flags=re.S)
             if ld_json:
                 try:
                     ld_data = json.loads(ld_json.group(1))
@@ -627,36 +645,44 @@ async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any
                     pass
 
             if not media_url:
-                og_match = re.search(r'<meta[^>]+property="og:image"[^>]+content="(https://[^"]+scontent[^"]+)"', html_text)
+                og_match = re.search(r'<meta[^>]+property="og:image"[^>]+content="(https://[^"]+scontent[^"]+)"', html)
                 if og_match:
                     media_url = og_match.group(1)
 
             if not media_url:
-                og_video = re.search(r'<meta[^>]+property="og:video"[^>]+content="(https://[^"]+)"', html_text)
+                og_video = re.search(r'<meta[^>]+property="og:video"[^>]+content="(https://[^"]+)"', html)
                 if og_video:
                     media_url = og_video.group(1)
                     is_video = True
 
             if media_url:
-                media_url = media_url.replace('\\u0026', '&').replace('&amp;', '&')
+                media_url = media_url.replace('\u0026', '&').replace('&amp;', '&')
                 ext = '.mp4' if is_video else '.jpg'
                 output_path = os.path.join(tempfile.gettempdir(), f"ig_post_{post_id}{ext}")
+
                 req_media = urllib.request.Request(media_url, headers=headers)
                 with urllib.request.urlopen(req_media, timeout=30, context=ctx) as response:
                     with open(output_path, 'wb') as f:
                         f.write(response.read())
+
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
                     return output_path, {"title": f"Instagram {post_id}", "is_video": is_video}
         except Exception as e:
             logging.warning(f"[Instagram] Post page xatolik: {e}")
 
+        logging.error(f"[Instagram] Barcha usullar ishlamadi. Post ID: {post_id}")
         return None, None
+
     return await asyncio.to_thread(_download)
 
 
 async def download_instagram_embed(url: str) -> str | None:
+    """
+    Instagram embed sahifasi orqali video/rasm yuklash (cookies siz).
+    """
     def _download_embed():
         import urllib.request
+
         try:
             post_id = None
             patterns = [
@@ -671,19 +697,23 @@ async def download_instagram_embed(url: str) -> str | None:
                 if match:
                     post_id = match.group(1)
                     break
+
             if not post_id:
                 return None
 
             embed_url = f"https://www.instagram.com/p/{post_id}/embed/"
+
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Referer': 'https://www.instagram.com/',
             }
+
             req = urllib.request.Request(embed_url, headers=headers)
+
             with urllib.request.urlopen(req, timeout=15) as response:
-                html_text = response.read().decode('utf-8')
+                html = response.read().decode('utf-8')
 
             video_patterns = [
                 r'"video_url":"([^"]+)"',
@@ -692,11 +722,12 @@ async def download_instagram_embed(url: str) -> str | None:
                 r'property="og:video" content="([^"]+)"',
                 r'property="og:video:secure_url" content="([^"]+)"',
             ]
+
             video_url = None
             for pattern in video_patterns:
-                match = re.search(pattern, html_text)
+                match = re.search(pattern, html)
                 if match:
-                    video_url = match.group(1).replace('\\u0026', '&')
+                    video_url = match.group(1).replace('\u0026', '&')
                     break
 
             if video_url:
@@ -717,11 +748,12 @@ async def download_instagram_embed(url: str) -> str | None:
                 r'"media_preview":"([^"]+)"',
                 r'data-src="([^"]+)"',
             ]
+
             image_url = None
             for pattern in image_patterns:
-                match = re.search(pattern, html_text)
+                match = re.search(pattern, html)
                 if match:
-                    image_url = match.group(1).replace('\\u0026', '&')
+                    image_url = match.group(1).replace('\u0026', '&')
                     break
 
             if image_url:
@@ -732,17 +764,23 @@ async def download_instagram_embed(url: str) -> str | None:
                         f.write(response.read())
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
                     return output_path
+
             return None
+
         except Exception as e:
             logging.warning(f"Instagram embed yuklashda xatolik: {e}")
             return None
+
     return await asyncio.to_thread(_download_embed)
 
 
 async def download_instagram_api(url: str) -> str | None:
+    """
+    Instagram API orqali yuklash (cookies siz).
+    """
     def _download_api():
         import urllib.request
-        import json
+
         try:
             post_id = None
             patterns = [
@@ -757,12 +795,18 @@ async def download_instagram_api(url: str) -> str | None:
                 if match:
                     post_id = match.group(1)
                     break
+
             if not post_id:
                 return None
 
             oembed_url = f"https://graph.facebook.com/v18.0/instagram_oembed?url=https://www.instagram.com/p/{post_id}/&access_token=APP_ID|APP_SECRET"
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            }
+
             req = urllib.request.Request(oembed_url, headers=headers)
+
             try:
                 with urllib.request.urlopen(req, timeout=10) as response:
                     data = json.loads(response.read().decode('utf-8'))
@@ -777,10 +821,13 @@ async def download_instagram_api(url: str) -> str | None:
                             return output_path
             except Exception:
                 pass
+
             return None
+
         except Exception as e:
             logging.warning(f"Instagram API yuklashda xatolik: {e}")
             return None
+
     result = await asyncio.to_thread(_download_api)
     if result:
         return result
@@ -788,11 +835,14 @@ async def download_instagram_api(url: str) -> str | None:
 
 
 async def download_instagram_post_page(url: str) -> str | None:
+    """
+    Instagram post sahifasini yuklab olish va rasm/video URL ini topish.
+    """
     def _download_post():
         import urllib.request
         import ssl
-        import json
         from urllib.parse import urlparse
+
         try:
             post_id = None
             patterns = [
@@ -807,6 +857,7 @@ async def download_instagram_post_page(url: str) -> str | None:
                 if match:
                     post_id = match.group(1)
                     break
+
             if not post_id:
                 return None
 
@@ -820,20 +871,21 @@ async def download_instagram_post_page(url: str) -> str | None:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+
             req = urllib.request.Request(post_url, headers=headers)
             with urllib.request.urlopen(req, timeout=20, context=ctx) as response:
-                html_text = response.read().decode('utf-8', errors='ignore')
+                html = response.read().decode('utf-8', errors='ignore')
 
             json_text = None
-            shared_data = re.search(r'window\._sharedData\s*=\s*(\{.*?\});</script>', html_text, flags=re.S)
+            shared_data = re.search(r'window\._sharedData\s*=\s*(\{.*?\});</script>', html, flags=re.S)
             if shared_data:
                 json_text = shared_data.group(1)
             else:
-                additional = re.search(r'window\.__additionalDataLoaded\([^,]+,\s*(\{.*?\})\);', html_text, flags=re.S)
+                additional = re.search(r'window\.__additionalDataLoaded\([^,]+,\s*(\{.*?\})\);', html, flags=re.S)
                 if additional:
                     json_text = additional.group(1)
                 else:
-                    ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html_text, flags=re.S)
+                    ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html, flags=re.S)
                     if ld_json:
                         json_text = ld_json.group(1)
 
@@ -873,17 +925,17 @@ async def download_instagram_post_page(url: str) -> str | None:
                                     break
 
             if not media_url:
-                video_match = re.search(r'property="og:video" content="([^"]+)"', html_text)
+                video_match = re.search(r'property="og:video" content="([^"]+)"', html)
                 if video_match:
                     media_url = video_match.group(1)
                     is_video = True
                 else:
-                    image_match = re.search(r'property="og:image" content="([^"]+)"', html_text)
+                    image_match = re.search(r'property="og:image" content="([^"]+)"', html)
                     if image_match:
                         media_url = image_match.group(1)
 
             if not media_url:
-                ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html_text, flags=re.S)
+                ld_json = re.search(r'<script type="application/ld\+json">(.*?)</script>', html, flags=re.S)
                 if ld_json:
                     try:
                         ld_data = json.loads(ld_json.group(1))
@@ -899,7 +951,7 @@ async def download_instagram_post_page(url: str) -> str | None:
                         pass
 
             if not media_url:
-                img_matches = re.findall(r'src="(https://[^"]+instagram\.com[^"]+\.(?:jpg|jpeg|png|webp))"', html_text)
+                img_matches = re.findall(r'src="(https://[^"]+instagram\.com[^"]+\.(?:jpg|jpeg|png|webp))"', html)
                 if img_matches:
                     media_url = img_matches[0]
 
@@ -916,12 +968,14 @@ async def download_instagram_post_page(url: str) -> str | None:
             with urllib.request.urlopen(req_media, timeout=30, context=ctx) as response:
                 with open(output_path, 'wb') as f:
                     f.write(response.read())
+
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
                 return output_path
             return None
         except Exception as e:
             logging.warning(f"Instagram post page yuklashda xatolik: {e}")
             return None
+
     return await asyncio.to_thread(_download_post)
 
 
@@ -1045,7 +1099,7 @@ TEXTS = {
             "🎵 Qo'shiq nomi yoki ijrochi\n"
             "🎙 Ovozli xabar\n"
             "📎 Audio/Video fayl\n"
-            "🔗 Ijtimoiy tarmoq linki (Instagram, YouTube, Pinterest, Snapchat)"
+            "🔗 Ijtimoiy tarmoq linki (Instagram, YouTube,Pinterest, Snapchat)"
         ),
         "document_received": (
             "📄 <b>Hujjat qabul qilindi</b>\n\n"
@@ -1064,7 +1118,7 @@ TEXTS = {
         ),
         "video_from_link": (
             "🎬 <b>Video yuklandi!</b>\n\n"
-            "🎵 Musiqani aniqlash uchun tugmani bosing!"
+            "🎵 Musiqani aniqlash uchun tugmani bosing:"
         ),
         "photo_from_link": (
             "📸 <b>Rasm yuklandi!</b>\n\n"
@@ -1505,7 +1559,6 @@ TEXTS = {
     },
 }
 
-
 # ========================== DATABASE ==========================
 class Database:
     def __init__(self, url: str):
@@ -1842,7 +1895,6 @@ def broadcast_skip_caption_kb() -> InlineKeyboardMarkup:
         ]
     )
 
-
 # ========================== LINK HELPERS ==========================
 def is_social_media_url(text: str) -> bool:
     patterns = [
@@ -1872,19 +1924,24 @@ def is_social_media_url(text: str) -> bool:
     ]
     return any(re.search(p, text) for p in patterns)
 
-
 async def resolve_short_url(url: str) -> str:
+    """Qisqa URL'larni to'liq URL'ga o'zgartirish"""
+    
     if re.search(r'https?://(?:vt|vm)\.tiktok\.com/\S+', url):
+        logging.info(f"[TikTok] Short URL o'z holida qoldirildi: {url}")
         return url
+    
     if re.search(r'https?://(?:www\.)?pin\.it/\S+', url):
         try:
             import urllib.request
             import ssl
+            
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+            
             req = urllib.request.Request(url, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Referer': 'https://www.pinterest.com/',
@@ -1892,9 +1949,11 @@ async def resolve_short_url(url: str) -> str:
             with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
                 final_url = resp.geturl()
                 if final_url != url and 'pinterest.com' in final_url:
+                    logging.info(f"[Pinterest] Short URL resolved: {url} -> {final_url}")
                     return final_url
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"[Pinterest] Short URL resolve error: {e}")
+    
     if re.search(r'https?://l\.likee\.video/v/\S+', url):
         match = re.search(r'/v/([A-Za-z0-9]+)', url)
         if match:
@@ -1905,17 +1964,227 @@ async def resolve_short_url(url: str) -> str:
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
+                
                 api_url = f"https://likee.video/v/{post_id}"
                 req = urllib.request.Request(api_url, headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
                 })
                 with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
                     final_url = resp.geturl()
-                    if final_url != 'https://likee.video/':
-                        return final_url
-            except Exception:
-                pass
+                    if 'trending' in final_url or final_url == 'https://likee.video/':
+                        logging.error(f"[Likee] Post ID topilmadi, redirect: {final_url}")
+                        return url
+                    return final_url
+            except Exception as e:
+                logging.warning(f"[Likee] URL resolve error: {e}")
+    
     return url
+
+async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
+    """
+    Instagram, YouTube va boshqa platformalardan video/rasm yuklash.
+    YouTube: Piped/Invidious (cookies/proxy kerak emas).
+    Boshqalar: yt-dlp.
+    """
+
+    # YouTube: Piped orqali
+    youtube_id = None
+    if "youtube.com" in url or "youtu.be" in url:
+        if "youtu.be/" in url:
+            youtube_id = url.split("youtu.be/")[-1].split("?")[0]
+        elif "v=" in url:
+            youtube_id = url.split("v=")[-1].split("&")[0]
+        
+        if youtube_id:
+            output_path = os.path.join(tempfile.gettempdir(), f"yt_piped_{youtube_id}.mp4")
+            result = await download_piped_video(youtube_id, output_path)
+            if result:
+                return result, {"title": f"YouTube {youtube_id}"}
+            # Invidious fallback
+            output_path2 = os.path.join(tempfile.gettempdir(), f"yt_invidious_{youtube_id}.mp4")
+            result = await download_invidious_video(youtube_id, output_path2)
+            if result:
+                return result, {"title": f"YouTube {youtube_id}"}
+
+    # Boshqa platformalar: yt-dlp (soddalashtirilgan)
+    def _download():
+        output_template = os.path.join(tempfile.gettempdir(), f"dl_{datetime.now().timestamp():.0f}_%(ext)s")
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best',
+            'outtmpl': output_template,
+            'quiet': True,
+            'no_warnings': True,
+            'ignoreerrors': True,
+            'socket_timeout': 60,
+            'retries': 3,
+        }
+        
+        if "tiktok" in url.lower():
+            ydl_opts['headers'] = {'Referer': 'https://www.tiktok.com/'}
+        elif "pinterest" in url.lower():
+            ydl_opts['format'] = 'best[ext=mp4]/bestvideo+bestaudio/best/bestimage/best'
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info:
+                    entries = info.get('entries', [info])
+                    for entry in entries:
+                        if not entry:
+                            continue
+                        downloaded_path = ydl.prepare_filename(entry)
+                        metadata = {"title": entry.get('title') or info.get('title')}
+                        if os.path.exists(downloaded_path):
+                            return downloaded_path, metadata
+                        base = downloaded_path.rsplit(".", 1)[0]
+                        for ext in ['.mp4', '.webm', '.mkv', '.mov', '.m4v', '.jpg', '.jpeg', '.png', '.webp']:
+                            candidate = base + ext
+                            if os.path.exists(candidate):
+                                return candidate, metadata
+        except Exception as e:
+            logging.warning(f"Video yuklashda xatolik: {e}")
+        return None, None
+    
+    result = await asyncio.to_thread(_download)
+    
+    # Pinterest fallback
+    if "pinterest" in url.lower() and (result is None or result[0] is None):
+        fallback_result = await download_pinterest_fallback(url)
+        if fallback_result and fallback_result[0]:
+            return fallback_result
+    
+    return result
+
+async def download_pinterest_fallback(url: str) -> tuple[str | None, dict[str, Any] | None]:
+    """Pinterest'dan rasm yuklash (yt-dlp ishlamaganda fallback)"""
+    def _download():
+        import urllib.request
+        import ssl
+        
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://www.pinterest.com/',
+            }
+            
+            req = urllib.request.Request(url, headers=headers)
+            
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
+                html = response.read().decode('utf-8', errors='ignore')
+            
+            image_url = None
+            
+            try:
+                json_pattern = r'<script[^>]*type="application/json"[^>]*>(.*?)</script>'
+                for match in re.finditer(json_pattern, html, re.DOTALL):
+                    try:
+                        data = json.loads(match.group(1))
+                        def find_image_url(obj):
+                            if isinstance(obj, dict):
+                                if 'images' in obj and isinstance(obj['images'], dict):
+                                    orig = obj['images'].get('orig', {})
+                                    if isinstance(orig, dict) and 'url' in orig:
+                                        return orig['url']
+                                if 'image' in obj and isinstance(obj, dict):
+                                    if 'url' in obj['image']:
+                                        return obj['image']['url']
+                                    if 'images' in obj['image']:
+                                        images = obj['image']['images']
+                                        if isinstance(images, dict):
+                                            orig = images.get('orig', {})
+                                            if isinstance(orig, dict) and 'url' in orig:
+                                                return orig['url']
+                                for v in obj.values():
+                                    result = find_image_url(v)
+                                    if result:
+                                        return result
+                            elif isinstance(obj, list):
+                                for item in obj:
+                                    result = find_image_url(item)
+                                    if result:
+                                        return result
+                            return None
+                        
+                        img_url = find_image_url(data)
+                        if img_url and 'pinimg.com' in img_url:
+                            image_url = img_url
+                            break
+                    except (json.JSONDecodeError, Exception):
+                        continue
+            except Exception as e:
+                logging.warning(f"[Pinterest] JSON parsing error: {e}")
+            
+            if not image_url:
+                image_patterns = [
+                    r'<img[^>]+data-test-id="pinCloseupImage"[^>]+src="(https://i\.pinimg\.com/[^"]+)"',
+                    r'<img[^>]+data-test-id="pinCloseupImage"[^>]+srcset="(https://i\.pinimg\.com/[^ ]+)',
+                    r'<img[^>]+src="(https://i\.pinimg\.com/originals/[^"]+)"',
+                    r'<img[^>]+src="(https://i\.pinimg\.com/[^"]+\.(?:jpg|jpeg|png|webp))"',
+                    r'property="og:image" content="(https://[^"]+pinimg\.com[^"]+)"',
+                    r'name="og:image" content="(https://[^"]+pinimg\.com[^"]+)"',
+                    r'<meta[^>]+property="twitter:image"[^>]+content="(https://[^"]+pinimg\.com[^"]+)"',
+                    r'"image":"(https://[^"]+pinimg\.com[^"]+)"',
+                    r'"url":"(https://i\.pinimg\.com/[^"]+)"',
+                    r'data-src="(https://i\.pinimg\.com/[^"]+)"',
+                    r'src="(https://s\.pinimg\.com/[^"]+)"',
+                ]
+                
+                for pattern in image_patterns:
+                    match = re.search(pattern, html)
+                    if match:
+                        image_url = match.group(1).replace('\\/', '/').split(' ')[0]
+                        break
+            
+            if not image_url:
+                all_pins = re.findall(r'src="(https://i\.pinimg\.com/[^"]+)"', html)
+                all_pins += re.findall(r'data-src="(https://i\.pinimg\.com/[^"]+)"', html)
+                all_pins += re.findall(r'content="(https://i\.pinimg\.com/[^"]+)"', html)
+                all_pins += re.findall(r'url\((https://i\.pinimg\.com/[^)]+)\)', html)
+                
+                if all_pins:
+                    for pin in all_pins:
+                        if 'originals' in pin:
+                            image_url = pin
+                            break
+                    if not image_url:
+                        image_url = max(all_pins, key=len)
+            
+            if not image_url:
+                og_match = re.search(r'<meta[^>]+property="og:image"[^>]+content="(https?://[^"]+)"', html)
+                if og_match:
+                    image_url = og_match.group(1)
+            
+            if not image_url:
+                logging.warning(f"[Pinterest] Rasm URL topilmadi")
+                return None, None
+            
+            output_path = os.path.join(tempfile.gettempdir(), f"pinterest_{datetime.now().timestamp():.0f}.jpg")
+            req_img = urllib.request.Request(image_url, headers=headers)
+            with urllib.request.urlopen(req_img, timeout=30, context=ctx) as response:
+                with open(output_path, 'wb') as f:
+                    f.write(response.read())
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                title_match = re.search(r'<title>([^<<]+)</title>', html)
+                title = title_match.group(1).strip() if title_match else "Pinterest"
+                logging.info(f"[Pinterest] Rasm yuklandi: {output_path}")
+                return output_path, {"title": title}
+            else:
+                logging.warning(f"[Pinterest] Yuklangan fayl juda kichik")
+                
+        except Exception as e:
+            logging.warning(f"[Pinterest] Fallback yuklashda xatolik: {e}")
+        return None, None
+    
+    return await asyncio.to_thread(_download)
 
 
 # ========================== FILE UTILS ==========================
@@ -1966,6 +2235,7 @@ async def extract_audio_ffmpeg(input_path: str) -> str:
 
 
 async def recognize_with_shazam(file_path: str):
+    """Shazam orqali musiqa aniqlash"""
     if shazam_client is None:
         logging.warning("ShazamIO o'rnatilmagan, aniqlash o'tkazib yuboriladi")
         return None
@@ -2074,6 +2344,7 @@ async def build_search_page(user_id: int, page: int):
     if row:
         kb.append(row)
 
+    # Navigatsiya tugmalari
     nav_row = []
     if page > 0:
         nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"page:{user_id}:{page - 1}"))
@@ -2088,6 +2359,7 @@ async def build_search_page(user_id: int, page: int):
         nav_row.append(InlineKeyboardButton(text="▶️", callback_data="noop"))
 
     kb.append(nav_row)
+
     text += f"\n<i>@{BOT_USERNAME} | Sahifa {page + 1}/{total_pages}</i>"
 
     return text, InlineKeyboardMarkup(inline_keyboard=kb)
@@ -2143,22 +2415,31 @@ async def select_music(call: CallbackQuery):
     item = state["results"][idx]
     title = item.get("title", "Noma'lum")
     uploader = item.get("uploader") or item.get("channel", "—")
+    url = item.get("url") or ""
     video_id = item.get("id", "")
-    url = item.get("url") or f"https://www.youtube.com/watch?v={video_id}"
+    
+    if not video_id and url:
+        match = re.search(r'[?&]v=([^&]+)', url)
+        if match:
+            video_id = match.group(1)
 
     lang = await get_lang(user_id)
+
     await call.answer()
 
-    # Audio yuklash - Piped/Invidious API orqali
-    safe = re.sub(r'[\\/*?:"<>|]', "_", f"{uploader} - {title}")
-    output_path = os.path.join(tempfile.gettempdir(), f"audio_{safe}_{datetime.now().timestamp():.0f}.mp3")
+    if not video_id:
+        await call.message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
+        return
 
-    audio_path = await download_audio(video_id, output_path)
+    # Piped orqali audio yuklash
+    safe_name = re.sub(r'[\\/*?:"<>|]', "_", f"{uploader} - {title}")
+    audio_path = await download_piped_audio(video_id, tempfile.gettempdir(), f"piped_{safe_name}")
 
     if not audio_path or not os.path.exists(audio_path):
         await call.message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
         return
 
+    # Fayl hajmi tekshirish
     size_mb = os.path.getsize(audio_path) / (1024 * 1024)
     if size_mb > MAX_SIZE_MB:
         await call.message.answer(
@@ -2167,6 +2448,7 @@ async def select_music(call: CallbackQuery):
         _cleanup_file(audio_path)
         return
 
+    # Audio yuborish
     await call.message.answer_audio(
         audio=FSInputFile(audio_path),
         title=title,
@@ -2179,6 +2461,7 @@ async def select_music(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("dl_music:"))
 async def dl_music_callback(call: CallbackQuery):
+    """Qo'shiqni yuklab olish — variantlar ro'yxatini chiqaradi"""
     parts = call.data.split(":")
     if len(parts) < 2:
         await call.answer("❌", show_alert=True)
@@ -2201,6 +2484,7 @@ async def dl_music_callback(call: CallbackQuery):
     await call.answer()
 
     try:
+        # Shazam orqali aniqlash
         query = None
         if path and os.path.exists(path):
             try:
@@ -2229,17 +2513,19 @@ async def dl_music_callback(call: CallbackQuery):
             await call.message.answer(TEXTS[lang]["not_recognized"])
             return
 
-        results = await search_music(query, max_results=15)
+        # Piped/Invidious qidirish
+        results = await search_youtube_tracks(query, max_results=15)
 
         if not results:
             await call.message.answer(TEXTS[lang]["music_not_found_group"], reply_markup=build_share_kb())
             return
 
+        # Natijalarni saqlash
         user_search_state[user_id] = {
             "results": results,
             "page": 0,
             "query": query,
-            "source": "piped",
+            "source": "youtube",
         }
 
         text, markup = await build_search_page(user_id, 0)
@@ -2279,20 +2565,26 @@ async def find_music_callback(call: CallbackQuery):
 
     try:
         tmp_path = path
+        ext = path.split(".")[-1] if "." in path else "mp4"
+
+        # Video bo'lsa audio ajratish
         if tmp_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv')):
             recognize_path = await extract_audio_ffmpeg(tmp_path)
         else:
             recognize_path = tmp_path
 
+        # Shazam orqali aniqlash
         shazam_result = await recognize_with_shazam(recognize_path)
 
     except Exception as e:
         logging.warning(f"Shazam aniqlashda xatolik: {e}")
         shazam_result = None
     finally:
+        # Vaqtinchalik fayllarni tozalash
         if recognize_path and recognize_path != tmp_path and recognize_path != path:
             _cleanup_file(recognize_path)
 
+    # Shazam topgan bo'lsa, uning natijalari bilan qidirish
     if shazam_result:
         title = shazam_result.get("title", "Noma'lum")
         artist = shazam_result.get("artist", "Noma'lum")
@@ -2309,15 +2601,16 @@ async def find_music_callback(call: CallbackQuery):
             _cleanup_file(path)
             return
 
+    # Piped/Invidious orqali qidirish
     try:
-        youtube_results = await search_music(query, max_results=15)
+        youtube_results = await search_youtube_tracks(query, max_results=15)
 
         if youtube_results:
             user_search_state[user_id] = {
                 "results": youtube_results,
                 "page": 0,
                 "query": f"🎵 {query}" if shazam_result else query,
-                "source": "piped",
+                "source": "youtube",
             }
 
             text, markup = await build_search_page(user_id, 0)
@@ -2330,7 +2623,6 @@ async def find_music_callback(call: CallbackQuery):
         await call.message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
     finally:
         _cleanup_file(path)
-
 
 # ========================== START / HELP / PROFILE ==========================
 @router.message(Command("start"))
@@ -2496,99 +2788,160 @@ async def text_handler(message: Message):
             await message.answer(TEXTS["uz"]["admin_welcome"], reply_markup=admin_main_kb())
             return
 
-    # LINK CHECK: Instagram, YouTube, TikTok, Likee, Threads, Pinterest, Snapchat
+    # LINK CHECK
     if is_social_media_url(message.text):
         try:
             url_text = message.text.strip()
-
+            
             if re.search(r'https?://(?:www\.)?threads\.com/', url_text, flags=re.I):
                 url_text = re.sub(r'^(https?://)(?:www\.)?threads\.com/', r"\1www.threads.net/", url_text, flags=re.I)
-
+            
             url_text = await resolve_short_url(url_text)
 
-            # Instagram uchun maxsus handler
-            if "instagram" in message.text.lower():
-                logging.info(f"[Instagram] Fallback boshlanmoqda: {message.text}")
+            downloaded_path, downloaded_meta = await download_video(url_text)
+            if not downloaded_path or not os.path.exists(downloaded_path):
+                # Instagram fallback
+                if "instagram" in message.text.lower():
+                    logging.info(f"[Instagram] Fallback boshlanmoqda: {message.text}")
 
-                direct_path, direct_meta = await download_instagram_direct(message.text)
-                if direct_path and os.path.exists(direct_path):
-                    file_size_mb = os.path.getsize(direct_path) / (1024 * 1024)
-                    ext = direct_path.split(".")[-1].lower()
-                    is_actually_video = direct_meta.get("is_video", False) if direct_meta else False
-                    if not is_actually_video:
-                        is_actually_video = ext in ('mp4', 'mov', 'avi', 'mkv', 'webm')
+                    direct_path, direct_meta = await download_instagram_direct(message.text)
+                    if direct_path and os.path.exists(direct_path):
+                        file_size_mb = os.path.getsize(direct_path) / (1024 * 1024)
+                        ext = direct_path.split(".")[-1].lower()
 
-                    if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp') or not is_actually_video:
-                        if file_size_mb <= 10:
+                        is_actually_video = direct_meta.get("is_video", False) if direct_meta else False
+                        if not is_actually_video:
+                            is_actually_video = ext in ('mp4', 'mov', 'avi', 'mkv', 'webm')
+
+                        if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp') or not is_actually_video:
+                            if file_size_mb <= 10:
+                                await message.answer_photo(
+                                    photo=FSInputFile(direct_path),
+                                    caption=SHARE_PROMO_CAPTION,
+                                    reply_markup=build_share_kb(),
+                                )
+                            else:
+                                await message.answer(SHARE_PROMO_CAPTION, reply_markup=build_share_kb())
+                            _cleanup_file(direct_path)
+                            return
+                        else:
+                            link_download_state[message.from_user.id] = {
+                                "path": direct_path,
+                                "title": direct_meta.get("title") if direct_meta else None,
+                            }
+                            kb = build_video_kb(message.from_user.id, lang)
+                            if file_size_mb <= 50:
+                                await message.answer_video(
+                                    video=FSInputFile(direct_path),
+                                    caption=SHARE_PROMO_CAPTION,
+                                    reply_markup=kb,
+                                )
+                            else:
+                                await message.answer(SHARE_PROMO_CAPTION, reply_markup=kb)
+                            return
+
+                    embed_path = await download_instagram_embed(message.text)
+                    if embed_path and os.path.exists(embed_path):
+                        file_size_mb = os.path.getsize(embed_path) / (1024 * 1024)
+                        ext = embed_path.split(".")[-1].lower()
+
+                        if ext in ('jpg', 'jpeg', 'png', 'webp'):
                             await message.answer_photo(
-                                photo=FSInputFile(direct_path),
+                                photo=FSInputFile(embed_path),
                                 caption=SHARE_PROMO_CAPTION,
                                 reply_markup=build_share_kb(),
                             )
+                            _cleanup_file(embed_path)
+                            return
                         else:
-                            await message.answer(SHARE_PROMO_CAPTION, reply_markup=build_share_kb())
-                        _cleanup_file(direct_path)
-                        return
-                    else:
-                        link_download_state[message.from_user.id] = {
-                            "path": direct_path,
-                            "title": direct_meta.get("title") if direct_meta else None,
-                        }
-                        kb = build_video_kb(message.from_user.id, lang)
-                        if file_size_mb <= 50:
-                            await message.answer_video(
-                                video=FSInputFile(direct_path),
-                                caption=SHARE_PROMO_CAPTION,
-                                reply_markup=kb,
-                            )
-                        else:
-                            await message.answer(SHARE_PROMO_CAPTION, reply_markup=kb)
-                        return
+                            link_download_state[message.from_user.id] = {
+                                "path": embed_path,
+                                "title": None,
+                            }
+                            kb = build_video_kb(message.from_user.id, lang)
+                            if file_size_mb <= 50:
+                                await message.answer_video(
+                                    video=FSInputFile(embed_path),
+                                    caption=SHARE_PROMO_CAPTION,
+                                    reply_markup=kb,
+                                )
+                            else:
+                                await message.answer(SHARE_PROMO_CAPTION, reply_markup=kb)
+                            return
 
-                embed_path = await download_instagram_embed(message.text)
-                if embed_path and os.path.exists(embed_path):
-                    file_size_mb = os.path.getsize(embed_path) / (1024 * 1024)
-                    ext = embed_path.split(".")[-1].lower()
-                    if ext in ('jpg', 'jpeg', 'png', 'webp'):
+                    api_path = await download_instagram_api(message.text)
+                    if api_path and os.path.exists(api_path):
                         await message.answer_photo(
-                            photo=FSInputFile(embed_path),
-                            caption=SHARE_PROMO_CAPTION,
+                            photo=FSInputFile(api_path),
+                            caption=TEXTS[lang]["photo_from_link"],
                             reply_markup=build_share_kb(),
                         )
-                        _cleanup_file(embed_path)
-                        return
-                    else:
-                        link_download_state[message.from_user.id] = {
-                            "path": embed_path,
-                            "title": None,
-                        }
-                        kb = build_video_kb(message.from_user.id, lang)
-                        if file_size_mb <= 50:
-                            await message.answer_video(
-                                video=FSInputFile(embed_path),
-                                caption=SHARE_PROMO_CAPTION,
-                                reply_markup=kb,
-                            )
-                        else:
-                            await message.answer(SHARE_PROMO_CAPTION, reply_markup=kb)
+                        _cleanup_file(api_path)
                         return
 
-                api_path = await download_instagram_api(message.text)
-                if api_path and os.path.exists(api_path):
-                    await message.answer_photo(
-                        photo=FSInputFile(api_path),
-                        caption=TEXTS[lang]["photo_from_link"],
-                        reply_markup=build_share_kb(),
-                    )
-                    _cleanup_file(api_path)
+                    logging.error(f"[Instagram] Barcha usullar ishlamadi: {message.text}")
+                    await asyncio.sleep(2)
+                    await message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
                     return
 
-                logging.error(f"[Instagram] Barcha usullar ishlamadi: {message.text}")
-                await asyncio.sleep(2)
                 await message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
                 return
 
-            await message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
+            file_size_mb = os.path.getsize(downloaded_path) / (1024 * 1024)
+            ext = downloaded_path.split(".")[-1].lower() if "." in downloaded_path else ""
+
+            import mimetypes
+            mime_type, _ = mimetypes.guess_type(downloaded_path)
+            is_video_file = mime_type and mime_type.startswith('video/')
+            is_image_file = mime_type and mime_type.startswith('image/')
+
+            if not is_video_file and not is_image_file:
+                with open(downloaded_path, 'rb') as f_check:
+                    header = f_check.read(12)
+                    if header.startswith(b'\xff\xd8\xff'):
+                        is_image_file = True
+                    elif header.startswith(b'\x89PNG'):
+                        is_image_file = True
+                    elif header.startswith(b'\x00\x00\x00') and b'ftyp' in header[:20]:
+                        is_video_file = True
+                    elif header.startswith(b'RIFF') or header.startswith(b'WEBP'):
+                        is_video_file = True
+
+            if is_image_file or ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'):
+                if file_size_mb <= 10:
+                    await message.answer_photo(
+                        photo=FSInputFile(downloaded_path),
+                        caption=SHARE_PROMO_CAPTION,
+                        reply_markup=build_share_kb(),
+                    )
+                else:
+                    await message.answer(SHARE_PROMO_CAPTION, reply_markup=build_share_kb())
+                _cleanup_file(downloaded_path)
+                return
+
+            link_download_state[message.from_user.id] = {
+                "path": downloaded_path,
+                "title": downloaded_meta.get("title") if downloaded_meta else None,
+            }
+
+            kb = build_video_kb(message.from_user.id, lang)
+
+            if file_size_mb <= 50:
+                try:
+                    await message.answer_video(
+                        video=FSInputFile(downloaded_path),
+                        caption=SHARE_PROMO_CAPTION,
+                        reply_markup=kb,
+                    )
+                except Exception as e:
+                    logging.warning(f"Video sifatida yuborish xato: {e}, rasm sifatida urinilmoqda")
+                    await message.answer_photo(
+                        photo=FSInputFile(downloaded_path),
+                        caption=SHARE_PROMO_CAPTION,
+                        reply_markup=kb,
+                    )
+            else:
+                await message.answer(SHARE_PROMO_CAPTION, reply_markup=kb)
             return
 
         except Exception as e:
@@ -2604,19 +2957,20 @@ async def text_handler(message: Message):
 
     msg = await message.answer(TEXTS[lang]["searching"])
 
-    results = await search_music(query, max_results=20)
+    # Piped qidiruv
+    results = await search_youtube_tracks(query, max_results=20)
 
     if not results:
         await msg.edit_text(TEXTS[lang]["music_not_found_group"], reply_markup=build_share_kb())
         return
 
-    await db.add_search(query, "piped", message.from_user.id)
+    await db.add_search(query, "youtube", message.from_user.id)
 
     user_search_state[message.from_user.id] = {
         "results": results,
         "page": 0,
         "query": query,
-        "source": "piped",
+        "source": "youtube",
     }
 
     text, markup = await build_search_page(message.from_user.id, 0)
@@ -2658,8 +3012,13 @@ async def document_handler(message: Message):
         TEXTS[lang]["document_received"].format(filename=filename, size_mb=f"{size_mb:.1f}")
     )
 
-# ========================== AUDIO RECOGNITION ==========================
+# ========================== AUDIO RECOGNITION (Shazam → Piped) ==========================
 async def process_audio_recognition(bot: Bot, file_id: str | None, user_id: int, message: Message, is_video: bool = False, local_path: str | None = None):
+    """
+    Ovozli xabar / audio / video fayldan yoki local fayldan musiqa aniqlash:
+    1. Shazam orqali aniqlash
+    2. Piped/Invidious orqali qidiruv
+    """
     lang = await get_lang(user_id)
     tmp_path = None
     recognize_path = None
@@ -2685,6 +3044,7 @@ async def process_audio_recognition(bot: Bot, file_id: str | None, user_id: int,
 
         result = await recognize_with_shazam(recognize_path)
 
+        # Cleanup
         if tmp_path and tmp_path != local_path:
             _cleanup_file(tmp_path)
         if recognize_path and recognize_path != tmp_path and recognize_path != local_path:
@@ -2698,7 +3058,8 @@ async def process_audio_recognition(bot: Bot, file_id: str | None, user_id: int,
         artist = result.get("artist", "Noma'lum")
         query = f"{artist} {title}".strip()
 
-        youtube_results = await search_music(query, max_results=15)
+        # Piped/Invidious orqali qidirish
+        youtube_results = await search_youtube_tracks(query, max_results=15)
 
         await loading_msg.delete()
 
@@ -2707,13 +3068,14 @@ async def process_audio_recognition(bot: Bot, file_id: str | None, user_id: int,
                 "results": youtube_results,
                 "page": 0,
                 "query": f"🎵 {artist} — {title}",
-                "source": "piped",
+                "source": "youtube",
             }
             text, markup = await build_search_page(user_id, 0)
             if text:
                 await message.answer(text, reply_markup=markup)
             return
 
+        # Topilmasa
         if lang == "uz":
             text = f"🎵 <b>{artist}</b> — <b>{title}</b>\n\n❌ YouTube'da topilmadi.\n🎵 Qo'shiq nomini yozib qidiring."
         elif lang == "uz_kr":
@@ -2913,7 +3275,6 @@ async def video_note_handler(message: Message):
     except Exception as e:
         logging.error(f"Video note handler error: {e}")
         await message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
-
 
 # ========================== PROFILE ==========================
 @router.callback_query(F.data == "profile")
@@ -3137,15 +3498,15 @@ async def main():
     else:
         print(f"[OK] FFmpeg topildi: {ffmpeg_cmd}")
 
+    print(f"[OK] Piped serverlari: {len(PIPED_SERVERS)} ta")
+    print(f"[OK] Invidious serverlari: {len(INVIDIOUS_SERVERS)} ta")
+
     if shazam_client is None:
         print("[WARN] ShazamIO o'rnatilmagan. Ovozli xabar aniqlash ishlamaydi.")
         if sys.version_info >= (3, 13):
             print("[WARN] Python 3.13+. ShazamIO ishlamasligi mumkin. Python 3.12 ishlatishni tavsiya qilamiz.")
     else:
         print("[OK] ShazamIO tayyor.")
-
-    print("[INFO] Piped/Invidious API orqali musiqa qidirish va yuklash ishlatiladi.")
-    print("[INFO] yt-dlp o'rniga faqat HTTP requests ishlatiladi.")
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
