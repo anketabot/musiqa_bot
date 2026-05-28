@@ -192,105 +192,203 @@ async def check_subscriptions(bot: Bot, user_id: int, channels: list) -> bool:
 
 
 async def search_youtube_tracks(query: str, max_results: int = 15) -> list:
-    """YouTube orqali qo'shiqlarni qidiradi (cookies siz ham ishlaydi)."""
-    def _search():
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "extract_flat": True,
-            "playlistend": max_results,
-            "default_search": "ytsearch",
-            "socket_timeout": 10,
-            "retries": 2,
-            "ignoreerrors": True,  # Xatoliklarni e'tiborsiz qoldirish
-            "headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        }
-
-        # YouTube cookies.txt mavjud bo'lsa - lekin avval SIZ urinib ko'ramiz
-        cookie_path = get_cookiefile()
-
-        def _do_search(use_cookies: bool = True):
-            opts_copy = dict(opts)
-            if use_cookies and cookie_path:
-                opts_copy["cookiefile"] = cookie_path
-            try:
-                with yt_dlp.YoutubeDL(opts_copy) as ydl:
-                    info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
-                    return info.get("entries", []) or [] if info else []
-            except Exception as e:
-                logging.warning(f"YouTube qidiruv xatosi (cookies={'ha' if use_cookies else 'yo\'q'}): {e}")
-                return []
-
-        # Avval cookies SIZ, keyin cookies BILAN
-        results = _do_search(use_cookies=False)
-        if results:
-            return results
-        return _do_search(use_cookies=True)
-
-    return await asyncio.to_thread(_search)
+    """
+    Piped API orqali qo'shiqlarni qidirish (cookies kerak emas)
+    """
+    return await search_piped(query, max_results)
 
 
-async def download_youtube_audio(url: str, filename: str) -> str | None:
-    """YouTube dan mp3 yuklab oladi (cookies siz ham ishlaydi)."""
+
+
+
+# ========================== PIPED API ==========================
+PIPED_INSTANCES = [
+    "https://api.piped.projectsegfault.com",
+    "https://pipedapi.moomoo.me",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.privacydev.net",
+    "https://pipedapi.mha.fi",
+    "https://api.piped.privacy.com.de",
+]
+
+async def search_piped(query: str, max_results: int = 15) -> list:
+    """
+    Piped API orqali YouTube'dan qidirish - cookies kerak emas
+    """
+    encoded_query = aiohttp.helpers.quote(query)
+    
+    for instance in PIPED_INSTANCES:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{instance}/search",
+                    params={"q": query, "filter": "music_songs"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Accept": "application/json",
+                    }
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        items = data.get("items", [])
+                        
+                        results = []
+                        for item in items[:max_results]:
+                            results.append({
+                                "id": item.get("url", "").split("v=")[-1] if "v=" in item.get("url", "") else item.get("url", "").split("/")[-1],
+                                "title": item.get("title", "Noma'lum"),
+                                "uploader": item.get("uploaderName", "Noma'lum"),
+                                "duration": item.get("duration", 0),
+                                "url": item.get("url", ""),
+                                "thumbnail": item.get("thumbnail", ""),
+                            })
+                        
+                        if results:
+                            logging.info(f"[Piped] {instance} dan {len(results)} ta natija topildi")
+                            return results
+                        
+        except Exception as e:
+            logging.warning(f"[Piped] {instance} xatolik: {e}")
+            continue
+    
+    logging.error("[Piped] Barcha instancelar ishlamadi")
+    return []
+
+
+async def get_piped_audio_url(video_id: str) -> tuple[str | None, dict | None]:
+    """
+    Piped API orqali audio stream URL va metadata olish
+    """
+    for instance in PIPED_INSTANCES:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{instance}/streams/{video_id}",
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Accept": "application/json",
+                    }
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        
+                        # Audio streams dan eng yaxshisini tanlash
+                        audio_streams = data.get("audioStreams", [])
+                        if not audio_streams:
+                            logging.warning(f"[Piped] {video_id} uchun audio stream topilmadi")
+                            continue
+                        
+                        # Eng yuqori sifatli audio stream
+                        best_audio = max(audio_streams, key=lambda x: x.get("bitrate", 0))
+                        audio_url = best_audio.get("url")
+                        
+                        if audio_url:
+                            metadata = {
+                                "title": data.get("title", "Noma'lum"),
+                                "uploader": data.get("uploader", "Noma'lum"),
+                                "thumbnail": data.get("thumbnailUrl", ""),
+                                "duration": data.get("duration", 0),
+                            }
+                            logging.info(f"[Piped] Audio URL topildi: {instance}")
+                            return audio_url, metadata
+                        
+        except Exception as e:
+            logging.warning(f"[Piped] {instance} streams xatolik: {e}")
+            continue
+    
+    logging.error(f"[Piped] {video_id} uchun audio URL topilmadi")
+    return None, None
+
+
+async def download_piped_audio(audio_url: str, filename: str) -> str | None:
+    """
+    Piped audio stream URL dan fayl yuklash
+    """
     def _download():
         safe = re.sub(r'[\\/*?:"<>|]', "_", filename)
-        output_path = os.path.join(tempfile.gettempdir(), f"yt_{safe}_%(ext)s")
-        opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best",
-            "outtmpl": output_path,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "ignoreerrors": True,
-            "headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        }
-        # Cookies mavjud bo'lsa qo'shamiz (majburiy emas)
-        cookie_path = get_cookiefile()
-        if cookie_path:
-            opts["cookiefile"] = cookie_path
+        output_path = os.path.join(tempfile.gettempdir(), f"piped_{safe}.mp3")
+        
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if not info:
-                    return None
-
-                downloaded = ydl.prepare_filename(info)
-                mp3_path = downloaded.rsplit(".", 1)[0] + ".mp3"
-
-                if os.path.exists(mp3_path):
-                    return mp3_path
-                if os.path.exists(downloaded):
-                    return downloaded
-
-            base = os.path.join(tempfile.gettempdir(), f"yt_{safe}")
-            for ext in [".mp3", ".m4a", ".webm", ".opus", ".mp4"]:
-                p = base + ext
-                if os.path.exists(p):
-                    return p
-            files = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(f"yt_{safe}")]
-            if files:
-                return os.path.join(tempfile.gettempdir(), sorted(files, key=lambda x: os.path.getmtime(os.path.join(tempfile.gettempdir(), x)), reverse=True)[0])
+            import urllib.request
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "*/*",
+                "Referer": "https://www.youtube.com/",
+            }
+            
+            req = urllib.request.Request(audio_url, headers=headers)
+            
+            with urllib.request.urlopen(req, timeout=60) as response:
+                with open(output_path, 'wb') as f:
+                    # Chunklarda yuklash
+                    while True:
+                        chunk = response.read(8192)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                file_size = os.path.getsize(output_path) / (1024 * 1024)
+                logging.info(f"[Piped] Audio yuklandi: {output_path} ({file_size:.1f} MB)")
+                return output_path
+            
             return None
+            
         except Exception as e:
-            logging.error(f"Audio yuklash xatosi: {e}")
+            logging.error(f"[Piped] Yuklash xatosi: {e}")
             return None
+    
     return await asyncio.to_thread(_download)
 
+async def download_youtube_audio(url: str, filename: str) -> str | None:
+    """
+    Piped API orqali YouTube'dan audio yuklash - FAqat Piped!
+    """
+    # Video ID ni ajratib olish
+    video_id = None
+    
+    # URL dan video ID ajratish
+    patterns = [
+        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+        r'youtu\.be\/([0-9A-Za-z_-]{11})',
+        r'youtube\.com\/embed\/([0-9A-Za-z_-]{11})',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            video_id = match.group(1)
+            break
+    
+    if not video_id:
+        # Agar URL emas, ID o'zi bo'lsa
+        if len(url) == 11 and re.match(r'^[0-9A-Za-z_-]+$', url):
+            video_id = url
+        else:
+            logging.error(f"[Piped] Video ID ajratib olinmadi: {url}")
+            return None
+    
+    logging.info(f"[Piped] Video ID: {video_id}")
+    
+    # Piped orqali audio URL olish
+    audio_url, metadata = await get_piped_audio_url(video_id)
+    
+    if not audio_url:
+        logging.error(f"[Piped] Audio URL topilmadi: {video_id}")
+        return None
+    
+    # Audio yuklash
+    safe_filename = filename or metadata.get("title", video_id) if metadata else video_id
+    audio_path = await download_piped_audio(audio_url, safe_filename)
+    
+    return audio_path
 
 
-
+# Eski funksiyani o'rnating
+download_youtube_audio_sync = download_youtube_audio
 
 def download_youtube_audio_sync(url: str, filename: str) -> str | None:
     """Sinxron versiya — 403 va format xatoliklarini hal qiladi"""
@@ -2729,7 +2827,7 @@ async def select_music(call: CallbackQuery):
     def _download():
         return download_youtube_audio_sync(url, f"{uploader} - {title}")
 
-    audio_path = await asyncio.to_thread(_download)
+    audio_path = await download_youtube_audio(url, f"{uploader} - {title}")
 
     if not audio_path or not os.path.exists(audio_path):
         await call.message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
