@@ -56,6 +56,13 @@ DATABASE_URL = (
     "@turntable.proxy.rlwy.net:14314/railway"
 )
 
+# YouTube Data API v3 — qidirish uchun (cookies kerak emas, bepul)
+# Olish: https://console.cloud.google.com/apis/credentials
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+
+# YouTube proxy (ixtiyoriy)
+YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "")
+
 MAX_SIZE_MB = 50
 RESULTS_PER_PAGE = 10
 
@@ -193,9 +200,172 @@ async def check_subscriptions(bot: Bot, user_id: int, channels: list) -> bool:
 
 async def search_youtube_tracks(query: str, max_results: int = 15) -> list:
     """
-    Piped API orqali qo'shiqlarni qidirish (cookies kerak emas)
+    Musiqa qidirish (cookies kerak emas):
+    1. YouTube Data API v3 (YOUTUBE_API_KEY bo'lsa)
+    2. yt-dlp ytsearch (fallback, cookies yo'q)
+    3. Piped API (oxirgi fallback)
     """
-    return await search_piped(query, max_results)
+    # 1. YouTube Data API v3
+    if YOUTUBE_API_KEY:
+        results = await _search_youtube_api(query, max_results)
+        if results:
+            logging.info(f"[Search] YouTube API: {len(results)} ta natija")
+            return results
+        logging.warning("[Search] YouTube API natija qaytarmadi, yt-dlp ga o'tmoqda...")
+
+    # 2. yt-dlp ytsearch (cookies yo'q)
+    results = await asyncio.to_thread(_search_ytdlp, query, max_results)
+    if results:
+        logging.info(f"[Search] yt-dlp ytsearch: {len(results)} ta natija")
+        return results
+    logging.warning("[Search] yt-dlp ytsearch ishlamadi, Piped ga o'tmoqda...")
+
+    # 3. Piped fallback
+    results = await search_piped(query, max_results)
+    if results:
+        logging.info(f"[Search] Piped: {len(results)} ta natija")
+    return results
+
+
+async def _search_youtube_api(query: str, max_results: int = 15) -> list:
+    """YouTube Data API v3 orqali qidirish — COOKIES KERAK EMAS"""
+    try:
+        params = {
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "videoCategoryId": "10",   # Music kategoriyasi
+            "maxResults": min(max_results, 50),
+            "key": YOUTUBE_API_KEY,
+            "fields": "items(id/videoId,snippet(title,channelTitle))",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 403:
+                    data = await resp.json()
+                    reason = data.get("error", {}).get("errors", [{}])[0].get("reason", "")
+                    if reason in ("quotaExceeded", "dailyLimitExceeded"):
+                        logging.warning("[YouTube API] Kunlik limit tugadi, yt-dlp ga o'tmoqda")
+                    else:
+                        logging.warning(f"[YouTube API] 403: {reason}")
+                    return []
+                if resp.status != 200:
+                    logging.warning(f"[YouTube API] Status {resp.status}")
+                    return []
+                data = await resp.json()
+
+        items = data.get("items", [])
+        if not items:
+            return []
+
+        # Duration olish uchun videos.list so'rov (batch)
+        video_ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
+        durations = {}
+        if video_ids:
+            dur_params = {
+                "part": "contentDetails",
+                "id": ",".join(video_ids),
+                "key": YOUTUBE_API_KEY,
+                "fields": "items(id,contentDetails/duration)",
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://www.googleapis.com/youtube/v3/videos",
+                    params=dur_params,
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp2:
+                    if resp2.status == 200:
+                        dur_data = await resp2.json()
+                        for v in dur_data.get("items", []):
+                            vid_id = v["id"]
+                            iso = v.get("contentDetails", {}).get("duration", "PT0S")
+                            durations[vid_id] = _parse_iso_duration(iso)
+
+        results = []
+        for it in items:
+            vid_id = it.get("id", {}).get("videoId", "")
+            if not vid_id:
+                continue
+            snippet = it.get("snippet", {})
+            results.append({
+                "id": vid_id,
+                "title": snippet.get("title", "Noma'lum"),
+                "uploader": snippet.get("channelTitle", "Noma'lum"),
+                "duration": durations.get(vid_id, 0),
+                "url": f"https://www.youtube.com/watch?v={vid_id}",
+                "thumbnail": f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg",
+            })
+        return results
+    except Exception as e:
+        logging.error(f"[YouTube API] Xatolik: {e}")
+        return []
+
+
+def _parse_iso_duration(iso: str) -> int:
+    """PT3M45S → 225 sekund"""
+    try:
+        m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso)
+        if not m:
+            return 0
+        h = int(m.group(1) or 0)
+        mi = int(m.group(2) or 0)
+        s = int(m.group(3) or 0)
+        return h * 3600 + mi * 60 + s
+    except Exception:
+        return 0
+
+
+def _search_ytdlp(query: str, max_results: int = 15) -> list:
+    """yt-dlp orqali YouTube qidirish — cookies kerak emas"""
+    try:
+        ffmpeg_cmd = find_ffmpeg_cmd()
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "socket_timeout": 20,
+            "retries": 2,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android_vr"],
+                    "formats": "missing_pot",
+                }
+            },
+        }
+        if ffmpeg_cmd:
+            opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
+        if YOUTUBE_PROXY:
+            opts["proxy"] = YOUTUBE_PROXY
+
+        search_url = f"ytsearch{max_results}:{query}"
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(search_url, download=False)
+            if not info or "entries" not in info:
+                return []
+            results = []
+            for entry in info["entries"]:
+                if not entry:
+                    continue
+                vid_id = entry.get("id", "")
+                results.append({
+                    "id": vid_id,
+                    "title": entry.get("title", "Noma'lum"),
+                    "uploader": entry.get("uploader") or entry.get("channel", "Noma'lum"),
+                    "duration": entry.get("duration", 0),
+                    "url": entry.get("webpage_url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else ""),
+                    "thumbnail": entry.get("thumbnail", ""),
+                })
+            return results
+    except Exception as e:
+        logging.error(f"[Search] yt-dlp ytsearch xatolik: {e}")
+        return []
+
 
 
 
@@ -345,93 +515,89 @@ async def download_piped_audio(audio_url: str, filename: str) -> str | None:
 
 async def download_youtube_audio(url: str, filename: str) -> str | None:
     """
-    Piped API orqali YouTube'dan audio yuklash - FAqat Piped!
+    YouTube'dan audio yuklash:
+    1. Piped API orqali urinish
+    2. Piped ishlamasa — yt-dlp (download_youtube_audio_sync) ga fallback
     """
-    # Video ID ni ajratib olish
+    # --- 1. Piped orqali urinish ---
     video_id = None
-    
-    # URL dan video ID ajratish
     patterns = [
         r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
         r'youtu\.be\/([0-9A-Za-z_-]{11})',
         r'youtube\.com\/embed\/([0-9A-Za-z_-]{11})',
     ]
-    
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
             video_id = match.group(1)
             break
-    
-    if not video_id:
-        # Agar URL emas, ID o'zi bo'lsa
-        if len(url) == 11 and re.match(r'^[0-9A-Za-z_-]+$', url):
-            video_id = url
-        else:
-            logging.error(f"[Piped] Video ID ajratib olinmadi: {url}")
-            return None
-    
-    logging.info(f"[Piped] Video ID: {video_id}")
-    
-    # Piped orqali audio URL olish
-    audio_url, metadata = await get_piped_audio_url(video_id)
-    
-    if not audio_url:
-        logging.error(f"[Piped] Audio URL topilmadi: {video_id}")
-        return None
-    
-    # Audio yuklash
-    safe_filename = filename or metadata.get("title", video_id) if metadata else video_id
-    audio_path = await download_piped_audio(audio_url, safe_filename)
-    
-    return audio_path
+    if not video_id and len(url) == 11 and re.match(r'^[0-9A-Za-z_-]+$', url):
+        video_id = url
+
+    if video_id:
+        try:
+            audio_url, metadata = await get_piped_audio_url(video_id)
+            if audio_url:
+                safe_filename = filename or (metadata.get("title", video_id) if metadata else video_id)
+                audio_path = await download_piped_audio(audio_url, safe_filename)
+                if audio_path and os.path.exists(audio_path):
+                    logging.info(f"[Audio] Piped orqali muvaffaqiyatli yuklandi: {audio_path}")
+                    return audio_path
+                logging.warning("[Audio] Piped audio fayl yuklashda muvaffaqiyatsiz, yt-dlp ga o'tmoqda...")
+            else:
+                logging.warning("[Audio] Piped audio URL topilmadi, yt-dlp ga o'tmoqda...")
+        except Exception as e:
+            logging.warning(f"[Audio] Piped xatolik: {e}, yt-dlp ga o'tmoqda...")
+    else:
+        logging.warning(f"[Audio] Video ID ajratib olinmadi ({url}), yt-dlp bilan to'g'ridan-to'g'ri urinish...")
+
+    # --- 2. yt-dlp fallback ---
+    logging.info(f"[Audio] yt-dlp orqali yuklanmoqda: {url}")
+    return await asyncio.to_thread(download_youtube_audio_sync, url, filename)
 
 
-# Eski funksiyani o'rnating
-download_youtube_audio_sync = download_youtube_audio
+# Eski nom saqlanadi (boshqa joylarda ishlatilmasin uchun)
+_download_youtube_audio_piped_only = download_youtube_audio
 
 def download_youtube_audio_sync(url: str, filename: str) -> str | None:
-    """Sinxron versiya — 403 va format xatoliklarini hal qiladi"""
+    """
+    YouTube audio yuklash — COOKIES KERAK EMAS.
+    Faqat cookies talab qilmaydigan clientlar ishlatiladi:
+    android_vr → tv_embedded → mweb → web_embedded
+    """
     safe = re.sub(r'[\\/*?:"<>|]', "_", filename)
     ffmpeg_cmd = find_ffmpeg_cmd()
-    cookie_path = get_cookiefile()
 
-    def _try_download(prefix: str, extra_opts: dict, use_cookies: bool = True) -> str | None:
+    def _try(prefix: str, player_client: str, extra: dict = None) -> str | None:
         output_path = os.path.join(tempfile.gettempdir(), f"{prefix}_{safe}.%(ext)s")
-
-        # ASOSIY sozlamalar - formatni moslashuvchan qilamiz
         opts = {
-            # 'bestaudio/best' o'rniga - avval audio, keyin video+audio, keyin istalgan format
-            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best',
-            'outtmpl': output_path,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best",
+            "outtmpl": output_path,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
             }],
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
-            'ignoreerrors': True,  # Xatoliklarni e'tiborsiz qoldirish
-            'socket_timeout': 30,
-            'retries': 3,
-            'sleep_requests': 2,
-            'sleep_interval': 1,
-            # PO Token bilan muammolarni oldini olish
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['mweb'],  # mweb eng ishonchli
-                    'formats': 'missing_pot',
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "ignoreerrors": False,
+            "socket_timeout": 30,
+            "retries": 3,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": [player_client],
+                    "formats": "missing_pot",
                 }
             },
+            # Cookies HECH QACHON ishlatilmaydi
         }
         if ffmpeg_cmd:
-            opts['ffmpeg_location'] = os.path.dirname(ffmpeg_cmd)
-        # MUHIM: Cookies faqat so'rovda aytilsa qo'shiladi
-        # GitHub issue #15330: cookies format tanlashni buzishi mumkin
-        if use_cookies and cookie_path:
-            opts['cookiefile'] = cookie_path
-        opts.update(extra_opts)
+            opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
+        if YOUTUBE_PROXY:
+            opts["proxy"] = YOUTUBE_PROXY
+        if extra:
+            opts.update(extra)
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -439,160 +605,87 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
                 if not info:
                     return None
 
-                # Agar postprocessor ishlamasa, original faylni qaytarish
                 downloaded = ydl.prepare_filename(info)
                 mp3_path = downloaded.rsplit(".", 1)[0] + ".mp3"
-
-                # ===== MUHIM FIX: Yuklangan fayl haqiqatan audio ekanligini tekshirish =====
                 check_path = mp3_path if os.path.exists(mp3_path) else downloaded
+
                 if os.path.exists(check_path):
-                    with open(check_path, 'rb') as f_check:
-                        header = f_check.read(100)
-
-                    # Agar fayl HTML bo'lsa (bot check page), uni o'chirish
-                    if header.startswith(b'<!DOCTYPE') or header.startswith(b'<html') or b'<HTML' in header[:50]:
-                        logging.warning(f"[Audio] Yuklangan fayl HTML sahifa (bot check). Cookies eskirgan bo'lishi mumkin.")
+                    # HTML page tekshirish (bot check)
+                    with open(check_path, "rb") as fc:
+                        header = fc.read(100)
+                    if (header.startswith(b'<!DOCTYPE') or header.startswith(b'<html')
+                            or b'<HTML' in header[:50]):
+                        logging.warning(f"[Audio] {player_client}: HTML sahifa qaytdi (bot check)")
                         os.remove(check_path)
-                        return "__EXPIRED_COOKIES__"  # Maxsus marker
-
-                    # Agar fayl juda kichik bo'lsa (< 1KB), xato
+                        return None
                     if os.path.getsize(check_path) < 1024:
-                        logging.warning(f"[Audio] Fayl juda kichik, ehtimol xato sahifa")
+                        logging.warning(f"[Audio] {player_client}: Fayl juda kichik")
                         os.remove(check_path)
                         return None
 
                 if os.path.exists(mp3_path):
+                    logging.info(f"[Audio] {player_client}: muvaffaqiyatli → {mp3_path}")
                     return mp3_path
                 if os.path.exists(downloaded):
+                    logging.info(f"[Audio] {player_client}: muvaffaqiyatli → {downloaded}")
                     return downloaded
 
-            # Faylni topish (fallback)
-            base = os.path.join(tempfile.gettempdir(), f"{prefix}_{safe}")
-            for ext in ['.mp3', '.m4a', '.webm', '.opus', '.mp4']:
-                p = base + ext
-                if os.path.exists(p) and os.path.getsize(p) > 1024:
-                    # HTML emasligini tekshirish
-                    with open(p, 'rb') as f_check:
-                        h = f_check.read(50)
-                    if not (h.startswith(b'<!DOCTYPE') or h.startswith(b'<html') or b'<HTML' in h[:50]):
-                        return p
-                    else:
-                        os.remove(p)  # HTML faylni o'chirish
+                # Fallback: temp papkada qidirish
+                base = os.path.join(tempfile.gettempdir(), f"{prefix}_{safe}")
+                for ext in [".mp3", ".m4a", ".webm", ".opus", ".mp4"]:
+                    p = base + ext
+                    if os.path.exists(p) and os.path.getsize(p) > 1024:
+                        with open(p, "rb") as fc:
+                            h = fc.read(50)
+                        if not (h.startswith(b'<!DOCTYPE') or h.startswith(b'<html')):
+                            logging.info(f"[Audio] {player_client}: fallback → {p}")
+                            return p
 
-            # Fallback: eng yangi faylni qidirish
-            files = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(f"{prefix}_{safe}")]
-            valid_files = []
-            for f in files:
-                p = os.path.join(tempfile.gettempdir(), f)
-                if os.path.getsize(p) > 1024:
-                    with open(p, 'rb') as f_check:
-                        h = f_check.read(50)
-                    if not (h.startswith(b'<!DOCTYPE') or h.startswith(b'<html') or b'<HTML' in h[:50]):
-                        valid_files.append(f)
-                    else:
-                        os.remove(p)
-
-            if valid_files:
-                return os.path.join(tempfile.gettempdir(), sorted(
-                    valid_files,
-                    key=lambda x: os.path.getmtime(os.path.join(tempfile.gettempdir(), x)),
-                    reverse=True
-                )[0])
-
-            return None
+                return None
         except Exception as e:
             err = str(e)
-            if '403' in err:
-                logging.warning(f"Download attempt ({prefix}) blocked: 403 Forbidden")
-            elif 'format' in err.lower() and 'not available' in err.lower():
-                logging.warning(f"Download attempt ({prefix}) format not available: {e}")
+            if "403" in err:
+                logging.warning(f"[Audio] {player_client}: 403 Forbidden")
+            elif "Sign in" in err or "login" in err.lower():
+                logging.warning(f"[Audio] {player_client}: Login talab qilindi (o'tkazib yuborildi)")
+            elif "unavailable" in err.lower() or "not available" in err.lower():
+                logging.warning(f"[Audio] {player_client}: Video mavjud emas")
             else:
-                logging.warning(f"Download attempt ({prefix}) failed: {e}")
-        return None
+                logging.warning(f"[Audio] {player_client}: {err[:120]}")
+            return None
 
-    # ===== UPDATED: Cookies eskirgan bo'lsa, keyingi urinishga o'tish =====
+    # ============================================================
+    # FAQAT COOKIES TALAB QILMAYDIGAN CLIENTLAR
+    # ============================================================
 
-    # 1-urinish: mweb client, COOKIES SIZ (eng ishonchli)
-    result = _try_download("dl", {}, use_cookies=False)
-    if result and result != "__EXPIRED_COOKIES__":
-        return result
-
-    # 2-urinish: mweb client, cookies BILAN (agar login talab qilinsa)
-    result = _try_download("dl_cook", {}, use_cookies=True)
+    # 1. android_vr — PO Token ham, cookies ham talab qilmaydi
+    result = _try("dl_vr", "android_vr")
     if result:
-        if result == "__EXPIRED_COOKIES__":
-            logging.info("[Audio] Cookies eskirgan, anonim urinishga o'tish...")
-        else:
-            return result
+        return result
 
-    # 3-urinish: tv client (cookies bilan)
-    result = _try_download("dl_tv", {
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['tv'],
-                'formats': 'missing_pot',
-            }
-        },
-    }, use_cookies=True)
+    # 2. tv_embedded — embed player, cookie-free
+    result = _try("dl_tve", "tv_embedded")
     if result:
-        if result == "__EXPIRED_COOKIES__":
-            pass  # Keyingi urinishga o'tish
-        else:
-            return result
-
-    # 4-urinish: android_vr (PO Token talab qilmaydi)
-    result = _try_download("dl_vr", {
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android_vr'],
-                'formats': 'missing_pot',
-            }
-        },
-        'headers': {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36',
-        },
-    }, use_cookies=False)
-    if result and result != "__EXPIRED_COOKIES__":
         return result
 
-    # 5-urinish: web_embedded (PO Token talab qilmaydi, faqat embeddable)
-    result = _try_download("dl_emb", {
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['web_embedded'],
-                'formats': 'missing_pot',
-            }
-        },
-    }, use_cookies=False)
-    if result and result != "__EXPIRED_COOKIES__":
+    # 3. mweb — mobil web, odatda cookie-free ishlaydi
+    result = _try("dl_mweb", "mweb")
+    if result:
         return result
 
-    # 6-urinish: android (cookies bilan)
-    result = _try_download("dl_and", {
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android'],
-                'formats': 'missing_pot',
-            }
-        },
-    }, use_cookies=True)
-    if result and result != "__EXPIRED_COOKIES__":
+    # 4. web_embedded — iframe embed, cookie-free
+    result = _try("dl_emb", "web_embedded")
+    if result:
         return result
 
-    # 7-urinish: ios (cookies bilan)
-    result = _try_download("dl_ios", {
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['ios'],
-                'formats': 'missing_pot',
-            }
-        },
-    }, use_cookies=True)
-    if result and result != "__EXPIRED_COOKIES__":
+    # 5. android — ko'pincha cookie-free ishlaydi
+    result = _try("dl_and", "android")
+    if result:
         return result
 
     logging.error(f"[Audio] Barcha usullar ishlamadi: {url}")
     return None
+
 
 async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any] | None]:
     """
@@ -2823,10 +2916,7 @@ async def select_music(call: CallbackQuery):
 
     await call.answer()
 
-    # Audio yuklash - hech qanday loading xabarisiz
-    def _download():
-        return download_youtube_audio_sync(url, f"{uploader} - {title}")
-
+    # Audio yuklash (Piped → yt-dlp fallback)
     audio_path = await download_youtube_audio(url, f"{uploader} - {title}")
 
     if not audio_path or not os.path.exists(audio_path):
