@@ -9,6 +9,7 @@ import shutil
 import hashlib
 import base64
 import html
+import time
 from datetime import datetime
 from typing import Any
 import dotenv
@@ -17,6 +18,10 @@ load_dotenv()
 import aiohttp
 import asyncpg
 import yt_dlp
+try:
+    import browser_cookie3
+except ImportError:
+    browser_cookie3 = None
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
     Message, CallbackQuery, ChatMemberUpdated,
@@ -60,7 +65,12 @@ DATABASE_URL = (
 # Olish: https://console.cloud.google.com/apis/credentials
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 
-# Proxy ishlatilmaydi — to'g'ridan-to'g'ri ulanish
+# YouTube proxy (ixtiyoriy)
+YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "")
+
+AUTO_REFRESH_COOKIES = os.getenv("AUTO_REFRESH_COOKIES", "0").lower() in ("1", "true", "yes")
+COOKIE_REFRESH_INTERVAL_HOURS = int(os.getenv("COOKIE_REFRESH_INTERVAL_HOURS", "6"))
+BROWSER_COOKIE_SOURCES = [b.strip() for b in os.getenv("BROWSER_COOKIE_SOURCES", "chrome,edge,firefox,chromium").split(",") if b.strip()]
 
 MAX_SIZE_MB = 50
 RESULTS_PER_PAGE = 10
@@ -72,6 +82,69 @@ BOT_USERNAME = "skachatinstavideo_bot"
 # ========================== UNIFIED COOKIE HELPER ==========================
 # Barcha platformalar uchun BIR cookie fayl
 COOKIE_FILE = os.path.join(os.getcwd(), "cookies.txt")
+
+
+def _is_youtube_cookiefile_valid(path: str) -> bool:
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            cookie_content = f.read()
+        has_youtube = '.youtube.com' in cookie_content
+        has_youtube_login = any(token in cookie_content for token in ('LOGIN_INFO', 'SID', 'SAPISID', 'APISID', 'HSID', 'SSID'))
+        return has_youtube and has_youtube_login
+    except Exception:
+        return False
+
+
+def _write_netscape_cookiejar(jar, path: str) -> bool:
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            for cookie in jar:
+                domain = cookie.domain or ""
+                flag = "TRUE" if domain.startswith('.') else "FALSE"
+                cookie_path = cookie.path or "/"
+                secure = "TRUE" if getattr(cookie, 'secure', False) else "FALSE"
+                expires = str(int(cookie.expires)) if getattr(cookie, 'expires', None) else "0"
+                f.write("\t".join([
+                    domain,
+                    flag,
+                    cookie_path,
+                    secure,
+                    expires,
+                    cookie.name,
+                    cookie.value,
+                ]) + "\n")
+        return True
+    except Exception as e:
+        logging.warning(f"[Cookies] Netscape cookie faylini yozishda xatolik: {e}")
+        return False
+
+
+def refresh_youtube_cookiefile() -> bool:
+    if browser_cookie3 is None:
+        logging.warning("[Cookies] browser_cookie3 mavjud emas, cookie refresh uchun o'rnatish kerak.")
+        return False
+
+    for source in BROWSER_COOKIE_SOURCES:
+        getter = getattr(browser_cookie3, source, None)
+        if not callable(getter):
+            continue
+
+        try:
+            jar = getter(domain_name='youtube.com')
+            if not jar:
+                continue
+
+            if any('youtube.com' in getattr(cookie, 'domain', '') for cookie in jar):
+                if _write_netscape_cookiejar(jar, COOKIE_FILE) and _is_youtube_cookiefile_valid(COOKIE_FILE):
+                    logging.info(f"[Cookies] YouTube cookies browserdan yangilandi: {source}")
+                    return True
+        except Exception as e:
+            logging.warning(f"[Cookies] {source} browser cookie olishda xato: {e}")
+            continue
+
+    logging.error("[Cookies] Browserdan YouTube cookies topilmadi yoki yozib bo'lmadi.")
+    return False
 
 
 def get_cookiefile() -> str | None:
@@ -90,19 +163,30 @@ def get_cookiefile() -> str | None:
             has_instagram = '.instagram.com' in cookie_content
             has_instagram_session = 'sessionid' in cookie_content.lower()
 
-            # Agar faqat Instagram cookies bo'lsa va session yo'q bo'lsa, ishlatma
             if has_instagram and not has_youtube and not has_instagram_session:
                 logging.info("[Cookies] Instagram cookies mavjud lekin sessionid yo'q. Anonim so'rov ishlatiladi.")
                 return None
 
-            # YouTube uchun faqat login cookies bilan ishlatish
             if has_youtube and not has_youtube_login:
+                if AUTO_REFRESH_COOKIES and refresh_youtube_cookiefile():
+                    return COOKIE_FILE
                 return None
 
-            return COOKIE_FILE
+            if AUTO_REFRESH_COOKIES:
+                age = time.time() - os.path.getmtime(COOKIE_FILE)
+                if age > COOKIE_REFRESH_INTERVAL_HOURS * 3600:
+                    if refresh_youtube_cookiefile():
+                        return COOKIE_FILE
 
-        except Exception:
             return COOKIE_FILE
+        except Exception:
+            if AUTO_REFRESH_COOKIES and refresh_youtube_cookiefile():
+                return COOKIE_FILE
+            return COOKIE_FILE if os.path.exists(COOKIE_FILE) else None
+
+    if AUTO_REFRESH_COOKIES and refresh_youtube_cookiefile():
+        return COOKIE_FILE
+
     return None
 
 
@@ -212,13 +296,18 @@ async def search_youtube_tracks(query: str, max_results: int = 15) -> list:
             return results
         logging.warning("[Search] YouTube API natija qaytarmadi, yt-dlp ga o'tmoqda...")
 
-    # 2. yt-dlp ytsearch (asosiy usul, cookies yo'q)
+    # 2. yt-dlp ytsearch (cookies yo'q)
     results = await asyncio.to_thread(_search_ytdlp, query, max_results)
     if results:
         logging.info(f"[Search] yt-dlp ytsearch: {len(results)} ta natija")
         return results
-    logging.warning("[Search] yt-dlp ytsearch ham ishlamadi")
-    return []
+    logging.warning("[Search] yt-dlp ytsearch ishlamadi, Piped ga o'tmoqda...")
+
+    # 3. Piped fallback
+    results = await search_piped(query, max_results)
+    if results:
+        logging.info(f"[Search] Piped: {len(results)} ta natija")
+    return results
 
 
 async def _search_youtube_api(query: str, max_results: int = 15) -> list:
@@ -334,6 +423,8 @@ def _search_ytdlp(query: str, max_results: int = 15) -> list:
         }
         if ffmpeg_cmd:
             opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
+        if YOUTUBE_PROXY:
+            opts["proxy"] = YOUTUBE_PROXY
 
         search_url = f"ytsearch{max_results}:{query}"
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -363,8 +454,15 @@ def _search_ytdlp(query: str, max_results: int = 15) -> list:
 
 
 
-# ========================== PIPED API (o'chirildi — ishonchsiz) ==========================
-PIPED_INSTANCES = []  # Piped instancelari olib tashlandi
+# ========================== PIPED API ==========================
+PIPED_INSTANCES = [
+    "https://api.piped.projectsegfault.com",
+    "https://pipedapi.moomoo.me",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.privacydev.net",
+    "https://pipedapi.mha.fi",
+    "https://api.piped.privacy.com.de",
+]
 
 async def search_piped(query: str, max_results: int = 15) -> list:
     """
@@ -500,9 +598,43 @@ async def download_piped_audio(audio_url: str, filename: str) -> str | None:
 
 async def download_youtube_audio(url: str, filename: str) -> str | None:
     """
-    YouTube'dan audio yuklash — to'g'ridan-to'g'ri yt-dlp orqali.
-    Proxy va Piped ishlatilmaydi.
+    YouTube'dan audio yuklash:
+    1. Piped API orqali urinish
+    2. Piped ishlamasa — yt-dlp (download_youtube_audio_sync) ga fallback
     """
+    # --- 1. Piped orqali urinish ---
+    video_id = None
+    patterns = [
+        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+        r'youtu\.be\/([0-9A-Za-z_-]{11})',
+        r'youtube\.com\/embed\/([0-9A-Za-z_-]{11})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            video_id = match.group(1)
+            break
+    if not video_id and len(url) == 11 and re.match(r'^[0-9A-Za-z_-]+$', url):
+        video_id = url
+
+    if video_id:
+        try:
+            audio_url, metadata = await get_piped_audio_url(video_id)
+            if audio_url:
+                safe_filename = filename or (metadata.get("title", video_id) if metadata else video_id)
+                audio_path = await download_piped_audio(audio_url, safe_filename)
+                if audio_path and os.path.exists(audio_path):
+                    logging.info(f"[Audio] Piped orqali muvaffaqiyatli yuklandi: {audio_path}")
+                    return audio_path
+                logging.warning("[Audio] Piped audio fayl yuklashda muvaffaqiyatsiz, yt-dlp ga o'tmoqda...")
+            else:
+                logging.warning("[Audio] Piped audio URL topilmadi, yt-dlp ga o'tmoqda...")
+        except Exception as e:
+            logging.warning(f"[Audio] Piped xatolik: {e}, yt-dlp ga o'tmoqda...")
+    else:
+        logging.warning(f"[Audio] Video ID ajratib olinmadi ({url}), yt-dlp bilan to'g'ridan-to'g'ri urinish...")
+
+    # --- 2. yt-dlp fallback ---
     logging.info(f"[Audio] yt-dlp orqali yuklanmoqda: {url}")
     return await asyncio.to_thread(download_youtube_audio_sync, url, filename)
 
@@ -510,11 +642,60 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
 # Eski nom saqlanadi (boshqa joylarda ishlatilmasin uchun)
 _download_youtube_audio_piped_only = download_youtube_audio
 
+
+def _is_youtube_blocking_response(file_path: str) -> bool:
+    """YouTube bot-block yoki login sahifasini aniqlash"""
+    if not os.path.exists(file_path):
+        return False
+    
+    try:
+        with open(file_path, 'rb') as f:
+            header = f.read(2048)  # Birinchi 2KB tekshirish
+        
+        # HTML/XML sahifasi (bot-block yoki login page)
+        if header.startswith(b'<!DOCTYPE') or header.startswith(b'<html') or b'<HTML' in header[:100]:
+            logging.warning(f"[Blocking] HTML page qaytdi (YouTube blocking yoki login)")
+            return True
+        
+        # Recaptcha/challenge sahifasi
+        if b'recaptcha' in header or b'challenge' in header or b'Sign in' in header:
+            logging.warning(f"[Blocking] Recaptcha/Sign-in page detected")
+            return True
+        
+        return False
+    except Exception:
+        return False
+
+
+def _detect_youtube_error(error_str: str) -> str:
+    """YouTube xatosini turini aniqlash va qayta yangilash kerakligini bilish"""
+    error_lower = error_str.lower()
+    
+    # Bot-block xatolari
+    if 'sign in' in error_lower or 'login' in error_lower:
+        return "LOGIN_REQUIRED"
+    if '403' in error_str or 'forbidden' in error_lower:
+        return "FORBIDDEN"
+    if '429' in error_str or 'too many requests' in error_lower:
+        return "RATE_LIMIT"
+    if 'unavailable' in error_lower or 'not available' in error_lower:
+        return "UNAVAILABLE"
+    if 'blocked' in error_lower or 'captcha' in error_lower:
+        return "BOT_BLOCKED"
+    
+    return "UNKNOWN"
+
+
+def _should_refresh_cookies_on_error(error_type: str) -> bool:
+    """Xatosiga qarab cookies yangilash kerakligini aniqlash"""
+    refresh_on = {'LOGIN_REQUIRED', 'FORBIDDEN', 'BOT_BLOCKED', 'RATE_LIMIT'}
+    return error_type in refresh_on
+
+
 def download_youtube_audio_sync(url: str, filename: str) -> str | None:
     """
-    YouTube audio yuklash — COOKIES KERAK EMAS.
-    Faqat cookies talab qilmaydigan clientlar ishlatiladi:
-    android_vr → tv_embedded → mweb → web_embedded
+    YouTube audio yuklash — AUTO-REFRESH COOKIES.
+    Xatolar bo'lsa cookies avtomatik yangilash va qayta urinish.
     """
     safe = re.sub(r'[\\/*?:"<>|]', "_", filename)
     ffmpeg_cmd = find_ffmpeg_cmd()
@@ -545,9 +726,13 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
         }
         if ffmpeg_cmd:
             opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
+        if YOUTUBE_PROXY:
+            opts["proxy"] = YOUTUBE_PROXY
         if extra:
             opts.update(extra)
 
+        blocked_detected = False
+        
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -560,15 +745,28 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
 
                 if os.path.exists(check_path):
                     # HTML page tekshirish (bot check)
-                    with open(check_path, "rb") as fc:
-                        header = fc.read(100)
-                    if (header.startswith(b'<!DOCTYPE') or header.startswith(b'<html')
-                            or b'<HTML' in header[:50]):
-                        logging.warning(f"[Audio] {player_client}: HTML sahifa qaytdi (bot check)")
+                    if _is_youtube_blocking_response(check_path):
+                        logging.warning(f"[Audio] {player_client}: YouTube BLOCKING detected (HTML page)")
+                        blocked_detected = True
                         os.remove(check_path)
+                        # Auto-refresh cookies agar AUTO_REFRESH_COOKIES enabled
+                        if AUTO_REFRESH_COOKIES and refresh_youtube_cookiefile():
+                            logging.info("[Audio] Cookies avtomatik yangilandi, qayta urinish...")
+                            # Recursive urinish cookiefile bilan
+                            return _try_with_cookies(prefix, player_client, extra)
                         return None
+                    
                     if os.path.getsize(check_path) < 1024:
-                        logging.warning(f"[Audio] {player_client}: Fayl juda kichik")
+                        logging.warning(f"[Audio] {player_client}: Fayl juda kichik ({os.path.getsize(check_path)} bytes)")
+                        with open(check_path, "rb") as fc:
+                            content_sample = fc.read()
+                        if b'<!DOCTYPE' in content_sample or b'<html' in content_sample or b'<HTML' in content_sample:
+                            logging.warning(f"[Audio] {player_client}: Kichik HTML fayl - YouTube BLOCKING")
+                            blocked_detected = True
+                            os.remove(check_path)
+                            if AUTO_REFRESH_COOKIES and refresh_youtube_cookiefile():
+                                logging.info("[Audio] Cookies avtomatik yangilandi, qayta urinish...")
+                                return _try_with_cookies(prefix, player_client, extra)
                         os.remove(check_path)
                         return None
 
@@ -593,14 +791,85 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
                 return None
         except Exception as e:
             err = str(e)
+            error_type = _detect_youtube_error(err)
+            
+            if error_type in ("LOGIN_REQUIRED", "BOT_BLOCKED", "FORBIDDEN", "RATE_LIMIT"):
+                logging.warning(f"[Audio] {player_client}: {error_type} — YouTube blocking detected")
+                if AUTO_REFRESH_COOKIES and _should_refresh_cookies_on_error(error_type):
+                    if refresh_youtube_cookiefile():
+                        logging.info("[Audio] Cookies avtomatik yangilandi, qayta urinish...")
+                        return _try_with_cookies(prefix, player_client, extra)
+            
             if "403" in err:
                 logging.warning(f"[Audio] {player_client}: 403 Forbidden")
             elif "Sign in" in err or "login" in err.lower():
-                logging.warning(f"[Audio] {player_client}: Login talab qilindi (o'tkazib yuborildi)")
+                logging.warning(f"[Audio] {player_client}: Login talab qilindi")
             elif "unavailable" in err.lower() or "not available" in err.lower():
                 logging.warning(f"[Audio] {player_client}: Video mavjud emas")
             else:
                 logging.warning(f"[Audio] {player_client}: {err[:120]}")
+            return None
+
+    def _try_with_cookies(prefix: str, player_client: str, extra: dict = None) -> str | None:
+        """Cookies bilan qayta urinish (1 marta)"""
+        cookiefile = get_cookiefile()
+        if not cookiefile:
+            logging.warning("[Audio] Cookies refresh qilindi lekin fayl mavjud emas, anonim urinish...")
+            return _try(f"{prefix}_retry", player_client, extra)
+        
+        output_path = os.path.join(tempfile.gettempdir(), f"{prefix}_ck_{safe}.%(ext)s")
+        opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best",
+            "outtmpl": output_path,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "ignoreerrors": False,
+            "socket_timeout": 30,
+            "retries": 3,
+            "cookiefile": cookiefile,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": [player_client],
+                    "formats": "missing_pot",
+                }
+            },
+        }
+        if ffmpeg_cmd:
+            opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
+        if YOUTUBE_PROXY:
+            opts["proxy"] = YOUTUBE_PROXY
+        if extra:
+            opts.update(extra)
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if not info:
+                    return None
+
+                downloaded = ydl.prepare_filename(info)
+                mp3_path = downloaded.rsplit(".", 1)[0] + ".mp3"
+                check_path = mp3_path if os.path.exists(mp3_path) else downloaded
+
+                if os.path.exists(check_path) and os.path.getsize(check_path) > 1024:
+                    if not _is_youtube_blocking_response(check_path):
+                        if os.path.exists(mp3_path):
+                            logging.info(f"[Audio] {player_client} + cookies: MUVAFFAQIYATLI → {mp3_path}")
+                            return mp3_path
+                        if os.path.exists(downloaded):
+                            logging.info(f"[Audio] {player_client} + cookies: MUVAFFAQIYATLI → {downloaded}")
+                            return downloaded
+                        os.remove(check_path) if os.path.exists(check_path) else None
+
+                return None
+        except Exception as e:
+            logging.warning(f"[Audio] {player_client} + cookies: {str(e)[:100]}")
             return None
 
     # ============================================================
@@ -632,8 +901,97 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
     if result:
         return result
 
+    cookiefile = get_cookiefile()
+    if cookiefile:
+        logging.info("[Audio] yt-dlp cookie bilan fallback urinish...")
+        result = _download_youtube_audio_with_cookies(url, filename, cookiefile)
+        if result:
+            return result
+
     logging.error(f"[Audio] Barcha usullar ishlamadi: {url}")
     return None
+
+
+def _download_youtube_audio_with_cookies(url: str, filename: str, cookiefile: str) -> str | None:
+    safe = re.sub(r'[\\/*?:"<>|]', "_", filename)
+    ffmpeg_cmd = find_ffmpeg_cmd()
+    output_path = os.path.join(tempfile.gettempdir(), f"dl_ck_{safe}.%(ext)s")
+    opts = {
+        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best",
+        "outtmpl": output_path,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "ignoreerrors": False,
+        "socket_timeout": 30,
+        "retries": 3,
+        "cookiefile": cookiefile,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android_vr"],
+                "formats": "missing_pot",
+            }
+        },
+    }
+    if ffmpeg_cmd:
+        opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
+    if YOUTUBE_PROXY:
+        opts["proxy"] = YOUTUBE_PROXY
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                return None
+
+            downloaded = ydl.prepare_filename(info)
+            mp3_path = downloaded.rsplit(".", 1)[0] + ".mp3"
+            check_path = mp3_path if os.path.exists(mp3_path) else downloaded
+
+            if os.path.exists(check_path):
+                # Blocking tekshiruvi
+                if _is_youtube_blocking_response(check_path) and os.path.getsize(check_path) < 100000:
+                    logging.warning("[Audio] Cookie fallback: YouTube blocking detected")
+                    if AUTO_REFRESH_COOKIES:
+                        logging.info("[Audio] Cookies qayta yangilash urinish...")
+                        if refresh_youtube_cookiefile():
+                            logging.info("[Audio] Cookies yangilandi, lekin replay qila olmamiz (cookie fallback bosqichida)")
+                    os.remove(check_path)
+                    return None
+                
+                if os.path.getsize(check_path) > 1024:
+                    if os.path.exists(mp3_path):
+                        logging.info(f"[Audio] Cookie fallback: MUVAFFAQIYATLI → {mp3_path}")
+                        return mp3_path
+                    if os.path.exists(downloaded):
+                        logging.info(f"[Audio] Cookie fallback: MUVAFFAQIYATLI → {downloaded}")
+                        return downloaded
+                os.remove(check_path) if os.path.exists(check_path) else None
+
+            return None
+    except Exception as e:
+        err = str(e)
+        error_type = _detect_youtube_error(err)
+        
+        if error_type in ("LOGIN_REQUIRED", "BOT_BLOCKED", "FORBIDDEN"):
+            logging.warning(f"[Audio] Cookie fallback: {error_type} — cookies yaroqsiz yoki eskirgan")
+            # Cookies yangilash urinish (lekin recursive call yo'q)
+            if AUTO_REFRESH_COOKIES:
+                logging.info("[Audio] Cookies qayta yangilash urinish...")
+                if refresh_youtube_cookiefile():
+                    logging.info("[Audio] Cookies yangilandi (replay uchun vaqt yo'q)")
+        elif "403" in err:
+            logging.warning("[Audio] Cookie fallback: 403 Forbidden")
+        elif "Sign in" in err or "login" in err.lower():
+            logging.warning("[Audio] Cookie fallback: Login talab qilindi")
+        else:
+            logging.warning(f"[Audio] Cookie fallback: {err[:120]}")
+        return None
 
 
 async def download_instagram_direct(url: str) -> tuple[str | None, dict[str, Any] | None]:
