@@ -60,8 +60,7 @@ DATABASE_URL = (
 # Olish: https://console.cloud.google.com/apis/credentials
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 
-# YouTube proxy (ixtiyoriy)
-YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "")
+# Proxy ishlatilmaydi — to'g'ridan-to'g'ri ulanish
 
 MAX_SIZE_MB = 50
 RESULTS_PER_PAGE = 10
@@ -213,18 +212,13 @@ async def search_youtube_tracks(query: str, max_results: int = 15) -> list:
             return results
         logging.warning("[Search] YouTube API natija qaytarmadi, yt-dlp ga o'tmoqda...")
 
-    # 2. yt-dlp ytsearch (cookies yo'q)
+    # 2. yt-dlp ytsearch (asosiy usul, cookies yo'q)
     results = await asyncio.to_thread(_search_ytdlp, query, max_results)
     if results:
         logging.info(f"[Search] yt-dlp ytsearch: {len(results)} ta natija")
         return results
-    logging.warning("[Search] yt-dlp ytsearch ishlamadi, Piped ga o'tmoqda...")
-
-    # 3. Piped fallback
-    results = await search_piped(query, max_results)
-    if results:
-        logging.info(f"[Search] Piped: {len(results)} ta natija")
-    return results
+    logging.warning("[Search] yt-dlp ytsearch ham ishlamadi")
+    return []
 
 
 async def _search_youtube_api(query: str, max_results: int = 15) -> list:
@@ -340,8 +334,6 @@ def _search_ytdlp(query: str, max_results: int = 15) -> list:
         }
         if ffmpeg_cmd:
             opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
-        if YOUTUBE_PROXY:
-            opts["proxy"] = YOUTUBE_PROXY
 
         search_url = f"ytsearch{max_results}:{query}"
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -371,15 +363,8 @@ def _search_ytdlp(query: str, max_results: int = 15) -> list:
 
 
 
-# ========================== PIPED API ==========================
-PIPED_INSTANCES = [
-    "https://api.piped.projectsegfault.com",
-    "https://pipedapi.moomoo.me",
-    "https://pipedapi.adminforge.de",
-    "https://api.piped.privacydev.net",
-    "https://pipedapi.mha.fi",
-    "https://api.piped.privacy.com.de",
-]
+# ========================== PIPED API (o'chirildi — ishonchsiz) ==========================
+PIPED_INSTANCES = []  # Piped instancelari olib tashlandi
 
 async def search_piped(query: str, max_results: int = 15) -> list:
     """
@@ -515,43 +500,9 @@ async def download_piped_audio(audio_url: str, filename: str) -> str | None:
 
 async def download_youtube_audio(url: str, filename: str) -> str | None:
     """
-    YouTube'dan audio yuklash:
-    1. Piped API orqali urinish
-    2. Piped ishlamasa — yt-dlp (download_youtube_audio_sync) ga fallback
+    YouTube'dan audio yuklash — to'g'ridan-to'g'ri yt-dlp orqali.
+    Proxy va Piped ishlatilmaydi.
     """
-    # --- 1. Piped orqali urinish ---
-    video_id = None
-    patterns = [
-        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
-        r'youtu\.be\/([0-9A-Za-z_-]{11})',
-        r'youtube\.com\/embed\/([0-9A-Za-z_-]{11})',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            video_id = match.group(1)
-            break
-    if not video_id and len(url) == 11 and re.match(r'^[0-9A-Za-z_-]+$', url):
-        video_id = url
-
-    if video_id:
-        try:
-            audio_url, metadata = await get_piped_audio_url(video_id)
-            if audio_url:
-                safe_filename = filename or (metadata.get("title", video_id) if metadata else video_id)
-                audio_path = await download_piped_audio(audio_url, safe_filename)
-                if audio_path and os.path.exists(audio_path):
-                    logging.info(f"[Audio] Piped orqali muvaffaqiyatli yuklandi: {audio_path}")
-                    return audio_path
-                logging.warning("[Audio] Piped audio fayl yuklashda muvaffaqiyatsiz, yt-dlp ga o'tmoqda...")
-            else:
-                logging.warning("[Audio] Piped audio URL topilmadi, yt-dlp ga o'tmoqda...")
-        except Exception as e:
-            logging.warning(f"[Audio] Piped xatolik: {e}, yt-dlp ga o'tmoqda...")
-    else:
-        logging.warning(f"[Audio] Video ID ajratib olinmadi ({url}), yt-dlp bilan to'g'ridan-to'g'ri urinish...")
-
-    # --- 2. yt-dlp fallback ---
     logging.info(f"[Audio] yt-dlp orqali yuklanmoqda: {url}")
     return await asyncio.to_thread(download_youtube_audio_sync, url, filename)
 
@@ -594,8 +545,6 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
         }
         if ffmpeg_cmd:
             opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
-        if YOUTUBE_PROXY:
-            opts["proxy"] = YOUTUBE_PROXY
         if extra:
             opts.update(extra)
 
