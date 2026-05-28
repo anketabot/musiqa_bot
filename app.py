@@ -40,6 +40,11 @@ try:
 except ImportError:
     Shazam = None
 
+try:
+    import speech_recognition as sr
+except ImportError:
+    sr = None
+
 
 def can_use_shazam() -> bool:
     if Shazam is None:
@@ -3034,6 +3039,53 @@ async def extract_audio_ffmpeg(input_path: str) -> str:
     return output_path
 
 
+async def transcribe_audio_to_text(audio_path: str) -> str | None:
+    if sr is None:
+        logging.warning("[Speech] SpeechRecognition o'rnatilmagan")
+        return None
+    if not os.path.exists(audio_path):
+        return None
+
+    wav_path = audio_path.rsplit(".", 1)[0] + "_speech.wav"
+    if not os.path.exists(wav_path):
+        ffmpeg_cmd = find_ffmpeg_cmd()
+        if not ffmpeg_cmd:
+            logging.warning("[Speech] FFmpeg topilmadi, transkripsiya mumkin emas")
+            return None
+
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg_cmd, "-y", "-i", audio_path,
+            "-ar", "16000", "-ac", "1", wav_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not os.path.exists(wav_path):
+            logging.warning(f"[Speech] FFmpeg audio konvertatsiya xatolik: {stderr.decode(errors='ignore')[:150]}")
+            return None
+
+    try:
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio = recognizer.record(source)
+
+        for language in ("uz-UZ", "ru-RU", "en-US"):
+            try:
+                text = recognizer.recognize_google(audio, language=language)
+                if text:
+                    logging.info(f"[Speech] Transcription ({language}): {text}")
+                    return text
+            except sr.UnknownValueError:
+                continue
+            except sr.RequestError as e:
+                logging.warning(f"[Speech] recognize_google xatolik: {e}")
+                break
+    except Exception as e:
+        logging.warning(f"[Speech] transkripsiya xatolik: {e}")
+
+    return None
+
+
 async def recognize_with_shazam(file_path: str):
     """Shazam orqali musiqa aniqlash"""
     if shazam_client is None:
@@ -3384,6 +3436,13 @@ async def find_music_callback(call: CallbackQuery):
         query = None
         if metadata_title:
             query = normalize_search_query(metadata_title)
+
+        if not query:
+            transcript = await transcribe_audio_to_text(path)
+            if transcript:
+                query = normalize_search_query(transcript) or transcript
+                logging.info(f"[Speech] qidiruv so'rovi: {query}")
+
         if not query:
             query = build_query_from_filename(path)
 
