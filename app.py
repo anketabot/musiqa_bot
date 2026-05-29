@@ -4,6 +4,7 @@ import warnings
 import re
 import asyncio
 import logging
+import subprocess
 import tempfile
 import shutil
 import hashlib
@@ -56,6 +57,77 @@ def can_use_shazam() -> bool:
         return False
 
 
+def _is_git_repo(path: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode == 0 and result.stdout.strip() == "true"
+    except Exception:
+        return False
+
+
+def _self_update() -> bool:
+    repo_path = os.getcwd()
+    if not _is_git_repo(repo_path):
+        logging.info("[AutoDeploy] Git repository emas, yangilash o'tkazib yuborildi.")
+        return False
+
+    try:
+        branch = AUTO_DEPLOY_BRANCH
+        remote = AUTO_DEPLOY_REMOTE
+        logging.info(f"[AutoDeploy] Yangilash: git fetch {remote}")
+        subprocess.run(["git", "fetch", remote], cwd=repo_path, check=True, capture_output=True, text=True, timeout=120)
+
+        logging.info(f"[AutoDeploy] Yangilash: git reset --hard {remote}/{branch}")
+        subprocess.run(["git", "reset", "--hard", f"{remote}/{branch}"], cwd=repo_path, check=True, capture_output=True, text=True, timeout=120)
+
+        req_path = os.path.join(repo_path, "requirements.txt")
+        if os.path.exists(req_path):
+            logging.info("[AutoDeploy] requirements.txt o'rnatilmoqda...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", "-r", req_path], cwd=repo_path, check=True, capture_output=True, text=True, timeout=300)
+
+        logging.info("[AutoDeploy] Yangilanish muvaffaqiyatli. Jarayon qayta ishga tushiriladi.")
+        return True
+    except subprocess.CalledProcessError as e:
+        logging.error(f"[AutoDeploy] Git update xatosi: {e.stderr or e.stdout}")
+    except Exception as e:
+        logging.error(f"[AutoDeploy] Yangilanish xatosi: {e}")
+    return False
+
+
+def _get_restart_command() -> list[str] | None:
+    # Agar container yoki oddiy Python ishlayotgan bo'lsa, hozirgi faylni qayta ishga tushuradi.
+    current_file = os.path.abspath(__file__)
+    python_exec = sys.executable
+    if current_file.endswith("app.py"):
+        return [python_exec, current_file]
+    return None
+
+
+def _schedule_auto_deploy():
+    async def _worker():
+        if not AUTO_DEPLOY:
+            return
+        interval = max(1, AUTO_DEPLOY_INTERVAL_HOURS) * 3600
+        while True:
+            await asyncio.sleep(interval)
+            logging.info("[AutoDeploy] Bir soatdan keyin yangilanish tekshirilmoqda...")
+            if _self_update():
+                restart_cmd = _get_restart_command()
+                if restart_cmd:
+                    logging.info("[AutoDeploy] Jarayon qayta ishga tushirilmoqda...")
+                    os.execv(restart_cmd[0], restart_cmd)
+                else:
+                    logging.warning("[AutoDeploy] Qayta ishga tushirish buyrug'i aniqlanmadi.")
+                    break
+    return asyncio.create_task(_worker())
+
+
 shazam_client = Shazam() if can_use_shazam() else None
 
 # ========================== CONFIG ==========================
@@ -72,6 +144,12 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 
 # YouTube proxy (ixtiyoriy)
 YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "")
+
+# Avtomatik o'zini yangilash (auto deploy)
+AUTO_DEPLOY = os.getenv("AUTO_DEPLOY", "0").lower() in ("1", "true", "yes")
+AUTO_DEPLOY_INTERVAL_HOURS = int(os.getenv("AUTO_DEPLOY_INTERVAL_HOURS", "1"))
+AUTO_DEPLOY_BRANCH = os.getenv("AUTO_DEPLOY_BRANCH", "main")
+AUTO_DEPLOY_REMOTE = os.getenv("AUTO_DEPLOY_REMOTE", "origin")
 
 AUTO_REFRESH_COOKIES = os.getenv("AUTO_REFRESH_COOKIES", "0").lower() in ("1", "true", "yes")
 COOKIE_REFRESH_INTERVAL_HOURS = int(os.getenv("COOKIE_REFRESH_INTERVAL_HOURS", "6"))
@@ -4415,6 +4493,9 @@ async def main():
                 await asyncio.sleep(1)
 
     await asyncio.sleep(2)
+
+    if AUTO_DEPLOY:
+        _schedule_auto_deploy()
 
     try:
         print("[INFO] Polling boshlanyapti...")
