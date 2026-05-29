@@ -113,7 +113,7 @@ def _schedule_auto_deploy():
     async def _worker():
         if not AUTO_DEPLOY:
             return
-        interval = max(1, AUTO_DEPLOY_INTERVAL_HOURS) * 3600
+        interval = max(0.25, AUTO_DEPLOY_INTERVAL_HOURS) * 3600
         while True:
             await asyncio.sleep(interval)
             logging.info("[AutoDeploy] Bir soatdan keyin yangilanish tekshirilmoqda...")
@@ -149,7 +149,7 @@ YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIE_FILE", "")
 
 # Avtomatik o'zini yangilash (auto deploy)
 AUTO_DEPLOY = os.getenv("AUTO_DEPLOY", "0").lower() in ("1", "true", "yes")
-AUTO_DEPLOY_INTERVAL_HOURS = int(os.getenv("AUTO_DEPLOY_INTERVAL_HOURS", "1"))
+AUTO_DEPLOY_INTERVAL_HOURS = float(os.getenv("AUTO_DEPLOY_INTERVAL_HOURS", "0.25"))
 AUTO_DEPLOY_BRANCH = os.getenv("AUTO_DEPLOY_BRANCH", "main")
 AUTO_DEPLOY_REMOTE = os.getenv("AUTO_DEPLOY_REMOTE", "origin")
 
@@ -207,6 +207,10 @@ def _write_netscape_cookiejar(jar, path: str) -> bool:
 
 
 def refresh_youtube_cookiefile() -> bool:
+    if os.path.exists(COOKIE_FILE) and _is_youtube_cookiefile_valid(COOKIE_FILE):
+        logging.info(f"[Cookies] Mavjud cookie fayl yaroqli: {COOKIE_FILE}")
+        return True
+
     if browser_cookie3 is None:
         logging.warning("[Cookies] browser_cookie3 mavjud emas, cookie refresh uchun o'rnatish kerak.")
         return False
@@ -998,7 +1002,7 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
     return None
 
 
-def _download_youtube_audio_with_cookies(url: str, filename: str, cookiefile: str) -> str | None:
+def _download_youtube_audio_with_cookies(url: str, filename: str, cookiefile: str, retry: bool = True) -> str | None:
     safe = re.sub(r'[\\/*?:"<>|]', "_", filename)
     ffmpeg_cmd = find_ffmpeg_cmd()
     output_path = os.path.join(tempfile.gettempdir(), f"dl_ck_{safe}.%(ext)s")
@@ -1043,11 +1047,10 @@ def _download_youtube_audio_with_cookies(url: str, filename: str, cookiefile: st
                 # Blocking tekshiruvi
                 if _is_youtube_blocking_response(check_path) and os.path.getsize(check_path) < 100000:
                     logging.warning("[Audio] Cookie fallback: YouTube blocking detected")
-                    if AUTO_REFRESH_COOKIES:
-                        logging.info("[Audio] Cookies qayta yangilash urinish...")
-                        if refresh_youtube_cookiefile():
-                            logging.info("[Audio] Cookies yangilandi, lekin replay qila olmamiz (cookie fallback bosqichida)")
                     os.remove(check_path)
+                    if AUTO_REFRESH_COOKIES and retry and refresh_youtube_cookiefile():
+                        logging.info("[Audio] Cookie fayl yangilandi, qayta urinish...")
+                        return _download_youtube_audio_with_cookies(url, filename, cookiefile, retry=False)
                     return None
                 
                 if os.path.getsize(check_path) > 1024:
@@ -1064,13 +1067,13 @@ def _download_youtube_audio_with_cookies(url: str, filename: str, cookiefile: st
         err = str(e)
         error_type = _detect_youtube_error(err)
         
-        if error_type in ("LOGIN_REQUIRED", "BOT_BLOCKED", "FORBIDDEN"):
+        if error_type in ("LOGIN_REQUIRED", "BOT_BLOCKED", "FORBIDDEN", "RATE_LIMIT"):
             logging.warning(f"[Audio] Cookie fallback: {error_type} — cookies yaroqsiz yoki eskirgan")
-            # Cookies yangilash urinish (lekin recursive call yo'q)
-            if AUTO_REFRESH_COOKIES:
+            if AUTO_REFRESH_COOKIES and retry:
                 logging.info("[Audio] Cookies qayta yangilash urinish...")
                 if refresh_youtube_cookiefile():
-                    logging.info("[Audio] Cookies yangilandi (replay uchun vaqt yo'q)")
+                    logging.info("[Audio] Cookie fayl yangilandi, qayta urinish...")
+                    return _download_youtube_audio_with_cookies(url, filename, cookiefile, retry=False)
         elif "403" in err:
             logging.warning("[Audio] Cookie fallback: 403 Forbidden")
         elif "Sign in" in err or "login" in err.lower():
@@ -2804,7 +2807,8 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
                                 if os.path.exists(candidate):
                                     return candidate, metadata
             except Exception as e:
-                logging.warning(f"Video yuklashda xatolik ({prefix}, cookies={'ha' if use_cookies else 'yo\'q'}): {e}")
+                cookie_text = 'ha' if use_cookies else "yo'q"
+                logging.warning(f"Video yuklashda xatolik ({prefix}, cookies={cookie_text}): {e}")
             return None
 
         # Proxy bilan yuklash urinishlari
@@ -3061,7 +3065,8 @@ async def download_audio_by_query(query: str) -> str | None:
                         if os.path.exists(p):
                             return p
             except Exception as e:
-                logging.warning(f"Audio yuklash xatoligi (cookies={'ha' if use_cookies else 'yo\'q'}): {e}")
+                cookie_text = 'ha' if use_cookies else "yo'q"
+                logging.warning(f"Audio yuklash xatoligi (cookies={cookie_text}): {e}")
             return None
 
         # Avval cookies SIZ, keyin cookies BILAN
