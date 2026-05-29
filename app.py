@@ -144,6 +144,8 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 
 # YouTube proxy (ixtiyoriy)
 YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "")
+# YouTube cookies fayli uchun maxsus yo‘l (agar qo‘lda eksport qilingan bo‘lsa)
+YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIE_FILE", "")
 
 # Avtomatik o'zini yangilash (auto deploy)
 AUTO_DEPLOY = os.getenv("AUTO_DEPLOY", "0").lower() in ("1", "true", "yes")
@@ -164,7 +166,8 @@ SHARE_PROMO_CAPTION = (
 BOT_USERNAME = "skachatinstavideo_bot"
 # ========================== UNIFIED COOKIE HELPER ==========================
 # Barcha platformalar uchun BIR cookie fayl
-COOKIE_FILE = os.path.join(os.getcwd(), "cookies.txt")
+DEFAULT_COOKIE_FILE = os.path.join(os.getcwd(), "cookies.txt")
+COOKIE_FILE = os.path.abspath(YOUTUBE_COOKIE_FILE) if YOUTUBE_COOKIE_FILE else DEFAULT_COOKIE_FILE
 
 
 def _is_youtube_cookiefile_valid(path: str) -> bool:
