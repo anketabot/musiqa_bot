@@ -128,6 +128,32 @@ def _schedule_auto_deploy():
     return asyncio.create_task(_worker())
 
 
+def _schedule_auto_cookie_refresh():
+    """Cookies har COOKIE_REFRESH_INTERVAL_HOURS da avtomatik refresh qilish"""
+    async def _worker():
+        if not AUTO_REFRESH_COOKIES:
+            logging.info("[Cookies] AUTO_REFRESH_COOKIES o'chirilgan")
+            return
+        
+        interval = max(1, COOKIE_REFRESH_INTERVAL_HOURS) * 3600  # Soatlarga o'tkazish
+        logging.info(f"[Cookies] Auto-refresh scheduled: har {COOKIE_REFRESH_INTERVAL_HOURS} soatda")
+        
+        while True:
+            await asyncio.sleep(interval)
+            logging.info("[Cookies] Avtomatik refresh tekshirilmoqda...")
+            
+            try:
+                # Cookies tekshirish va yangilash
+                if refresh_youtube_cookiefile(force=False):  # force=False = faqat eskirgan bo'lsa yangilash
+                    logging.info("[Cookies] ✓ Avtomatik refresh muvaffaqiyatli")
+                else:
+                    logging.warning("[Cookies] Avtomatik refresh amalga oshmadi yoki browserdan topilmadi")
+            except Exception as e:
+                logging.warning(f"[Cookies] Avtomatik refresh xatosi: {e}")
+    
+    return asyncio.create_task(_worker())
+
+
 shazam_client = Shazam() if can_use_shazam() else None
 
 # ========================== CONFIG ==========================
@@ -170,14 +196,57 @@ DEFAULT_COOKIE_FILE = os.path.join(os.getcwd(), "cookies.txt")
 COOKIE_FILE = os.path.abspath(YOUTUBE_COOKIE_FILE) if YOUTUBE_COOKIE_FILE else DEFAULT_COOKIE_FILE
 
 
-def _is_youtube_cookiefile_valid(path: str) -> bool:
+def _is_youtube_cookiefile_valid(path: str, check_expiry: bool = True) -> bool:
+    """Cookies fayli tekshirish (expiry ham tekshiriladi)"""
     try:
+        if not os.path.exists(path):
+            return False
+        
         with open(path, 'r', encoding='utf-8') as f:
-            cookie_content = f.read()
-        has_youtube = '.youtube.com' in cookie_content
-        has_youtube_login = any(token in cookie_content for token in ('LOGIN_INFO', 'SID', 'SAPISID', 'APISID', 'HSID', 'SSID'))
+            lines = f.readlines()
+        
+        has_youtube = False
+        has_youtube_login = False
+        now = int(time.time())
+        expired_count = 0
+        total_cookies = 0
+        
+        for line in lines:
+            if line.startswith('#') or not line.strip():
+                continue
+            
+            parts = line.strip().split('\t')
+            if len(parts) < 7:
+                continue
+            
+            total_cookies += 1
+            domain, _, _, _, expiry_str, name, value = parts[:7]
+            
+            # YouTube domain tekshirish
+            if 'youtube.com' in domain:
+                has_youtube = True
+            
+            # YouTube login tokens
+            if any(token in name for token in ('LOGIN_INFO', 'SID', 'SAPISID', 'APISID', 'HSID', 'SSID')):
+                has_youtube_login = True
+            
+            # Expiry tekshirish
+            if check_expiry and expiry_str != '0':
+                try:
+                    expiry = int(expiry_str)
+                    if expiry > 0 and expiry < now:
+                        expired_count += 1
+                except (ValueError, TypeError):
+                    pass
+        
+        # Agar cookies 50% dan ko'proq eskirgan bo'lsa - invalid deb bilish
+        if check_expiry and total_cookies > 0 and (expired_count / total_cookies) > 0.5:
+            logging.info(f"[Cookies] {expired_count}/{total_cookies} cookies eskirgan, yangilash kerak")
+            return False
+        
         return has_youtube and has_youtube_login
-    except Exception:
+    except Exception as e:
+        logging.debug(f"[Cookies] Validation xatosi: {e}")
         return False
 
 
@@ -206,15 +275,18 @@ def _write_netscape_cookiejar(jar, path: str) -> bool:
         return False
 
 
-def refresh_youtube_cookiefile() -> bool:
-    if os.path.exists(COOKIE_FILE) and _is_youtube_cookiefile_valid(COOKIE_FILE):
-        logging.info(f"[Cookies] Mavjud cookie fayl yaroqli: {COOKIE_FILE}")
+def refresh_youtube_cookiefile(force: bool = False) -> bool:
+    """Avtomatik YouTube cookies refresh - browserdan olish"""
+    # Agar force=False va cookies fresh bo'lsa - qaytarish
+    if not force and os.path.exists(COOKIE_FILE) and _is_youtube_cookiefile_valid(COOKIE_FILE, check_expiry=True):
         return True
 
     if browser_cookie3 is None:
-        logging.warning("[Cookies] browser_cookie3 mavjud emas, cookie refresh uchun o'rnatish kerak.")
+        logging.debug("[Cookies] browser_cookie3 mavjud emas")
         return False
 
+    logging.info("[Cookies] YouTube cookies browserdan yangilash...")
+    
     for source in BROWSER_COOKIE_SOURCES:
         getter = getattr(browser_cookie3, source, None)
         if not callable(getter):
@@ -225,16 +297,17 @@ def refresh_youtube_cookiefile() -> bool:
             if not jar:
                 continue
 
-            if any('youtube.com' in getattr(cookie, 'domain', '') for cookie in jar):
-                if _write_netscape_cookiejar(jar, COOKIE_FILE) and _is_youtube_cookiefile_valid(COOKIE_FILE):
-                    logging.info(f"[Cookies] YouTube cookies browserdan yangilandi: {source}")
+            has_youtube = any('youtube.com' in getattr(cookie, 'domain', '') for cookie in jar)
+            if has_youtube:
+                if _write_netscape_cookiejar(jar, COOKIE_FILE) and _is_youtube_cookiefile_valid(COOKIE_FILE, check_expiry=False):
+                    logging.info(f"[Cookies] ✓ YouTube cookies muvaffaqiyatli yangilandi: {source}")
                     return True
         except Exception as e:
-            logging.warning(f"[Cookies] {source} browser cookie olishda xato: {e}")
+            logging.debug(f"[Cookies] {source} xatosi: {str(e)[:100]}")
             continue
 
-    logging.error("[Cookies] Browserdan YouTube cookies topilmadi yoki yozib bo'lmadi.")
-    return False
+    logging.warning("[Cookies] Browserdan cookies topilmadi, existing file ishlatiladi")
+    return os.path.exists(COOKIE_FILE) and _is_youtube_cookiefile_valid(COOKIE_FILE, check_expiry=False)
 
 
 def get_cookiefile() -> str | None:
@@ -688,10 +761,17 @@ async def download_piped_audio(audio_url: str, filename: str) -> str | None:
 
 async def download_youtube_audio(url: str, filename: str) -> str | None:
     """
-    YouTube'dan audio yuklash:
-    1. Piped API orqali urinish
-    2. Piped ishlamasa — yt-dlp (download_youtube_audio_sync) ga fallback
+    YouTube'dan audio yuklash - avtomatik cookie refresh va multi-strategy retry:
+    1. Cookies tekshirish va auto-refresh (eskirgan bo'lsa)
+    2. Piped API orqali urinish
+    3. yt-dlp cookie-free clients bilan
+    4. yt-dlp cookies bilan
+    5. Agar hammasida xato - auto-refresh va qayta urinish
     """
+    # Har download qabul cookies'ni tekshirish va refresh qilish
+    if AUTO_REFRESH_COOKIES:
+        refresh_youtube_cookiefile(force=False)  # Eskirgan bo'lsa yangilash
+    
     # --- 1. Piped orqali urinish ---
     video_id = None
     patterns = [
@@ -3361,11 +3441,30 @@ async def select_music(call: CallbackQuery):
 
     await call.answer()
 
-    # Audio yuklash (Piped → yt-dlp fallback)
-    audio_path = await download_youtube_audio(url, f"{uploader} - {title}")
+    # Audio yuklash — maksimal 3 marta retry (cookies auto-refresh bilan)
+    max_retries = 3
+    audio_path = None
+    
+    for attempt in range(1, max_retries + 1):
+        audio_path = await download_youtube_audio(url, f"{uploader} - {title}")
+        
+        if audio_path and os.path.exists(audio_path):
+            logging.info(f"[Select] Audio muvaffaqiyatli yuklandi (attempt {attempt}/{max_retries})")
+            break
+        
+        if attempt < max_retries:
+            # Cookies avtomatik yangilash - eskirgan bo'lsa
+            if AUTO_REFRESH_COOKIES:
+                logging.info(f"[Select] Cookies yangilash urinish {attempt}/{max_retries}...")
+                refresh_youtube_cookiefile(force=True)
+                await asyncio.sleep(2)  # 2 soniya kutish
+        else:
+            logging.warning(f"[Select] {attempt} marta urinish keyin ham audio yuklanmadi: {url}")
 
     if not audio_path or not os.path.exists(audio_path):
-        await call.message.answer(TEXTS[lang]["download_failed_group"], reply_markup=build_share_kb())
+        # Silent error - foydalanuvchiga minimal xatolik
+        logging.warning(f"[Select] Audio yuklash final xatosi: {uploader} - {title}")
+        await call.message.answer("⚠️ Musiqa hozircha mavjud emas. Boshqa qo'shiq tanlang.", reply_markup=build_share_kb())
         return
 
     # Fayl hajmi tekshirish
@@ -4504,6 +4603,9 @@ async def main():
 
     if AUTO_DEPLOY:
         _schedule_auto_deploy()
+
+    if AUTO_REFRESH_COOKIES:
+        _schedule_auto_cookie_refresh()
 
     try:
         print("[INFO] Polling boshlanyapti...")
