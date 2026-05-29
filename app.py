@@ -113,10 +113,10 @@ def _schedule_auto_deploy():
     async def _worker():
         if not AUTO_DEPLOY:
             return
-        interval = max(0.25, AUTO_DEPLOY_INTERVAL_HOURS) * 3600
+        interval = max(1, AUTO_DEPLOY_INTERVAL_MINUTES) * 60
         while True:
             await asyncio.sleep(interval)
-            logging.info("[AutoDeploy] Bir soatdan keyin yangilanish tekshirilmoqda...")
+            logging.info("[AutoDeploy] 15 minutdan keyin yangilanish tekshirilmoqda...")
             if _self_update():
                 restart_cmd = _get_restart_command()
                 if restart_cmd:
@@ -149,7 +149,7 @@ YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIE_FILE", "")
 
 # Avtomatik o'zini yangilash (auto deploy)
 AUTO_DEPLOY = os.getenv("AUTO_DEPLOY", "0").lower() in ("1", "true", "yes")
-AUTO_DEPLOY_INTERVAL_HOURS = float(os.getenv("AUTO_DEPLOY_INTERVAL_HOURS", "0.25"))
+AUTO_DEPLOY_INTERVAL_MINUTES = int(os.getenv("AUTO_DEPLOY_INTERVAL_MINUTES", "15"))
 AUTO_DEPLOY_BRANCH = os.getenv("AUTO_DEPLOY_BRANCH", "main")
 AUTO_DEPLOY_REMOTE = os.getenv("AUTO_DEPLOY_REMOTE", "origin")
 
