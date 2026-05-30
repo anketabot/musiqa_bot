@@ -3440,51 +3440,57 @@ async def select_music(call: CallbackQuery):
     lang = await get_lang(user_id)
 
     await call.answer()
-
-    # Audio yuklash — maksimal 3 marta retry (cookies auto-refresh bilan)
-    max_retries = 3
-    audio_path = None
+    loading_msg = await call.message.answer(TEXTS[lang]["searching"])
+    try:
+        # Audio yuklash — maksimal 3 marta retry (cookies auto-refresh bilan)
+        max_retries = 3
+        audio_path = None
     
-    for attempt in range(1, max_retries + 1):
-        audio_path = await download_youtube_audio(url, f"{uploader} - {title}")
-        
-        if audio_path and os.path.exists(audio_path):
-            logging.info(f"[Select] Audio muvaffaqiyatli yuklandi (attempt {attempt}/{max_retries})")
-            break
-        
-        if attempt < max_retries:
-            # Cookies avtomatik yangilash - eskirgan bo'lsa
-            if AUTO_REFRESH_COOKIES:
-                logging.info(f"[Select] Cookies yangilash urinish {attempt}/{max_retries}...")
-                refresh_youtube_cookiefile(force=True)
-                await asyncio.sleep(2)  # 2 soniya kutish
-        else:
-            logging.warning(f"[Select] {attempt} marta urinish keyin ham audio yuklanmadi: {url}")
+        for attempt in range(1, max_retries + 1):
+            audio_path = await download_youtube_audio(url, f"{uploader} - {title}")
+            
+            if audio_path and os.path.exists(audio_path):
+                logging.info(f"[Select] Audio muvaffaqiyatli yuklandi (attempt {attempt}/{max_retries})")
+                break
+            
+            if attempt < max_retries:
+                # Cookies avtomatik yangilash - eskirgan bo'lsa
+                if AUTO_REFRESH_COOKIES:
+                    logging.info(f"[Select] Cookies yangilash urinish {attempt}/{max_retries}...")
+                    refresh_youtube_cookiefile(force=True)
+                    await asyncio.sleep(2)  # 2 soniya kutish
+            else:
+                logging.warning(f"[Select] {attempt} marta urinish keyin ham audio yuklanmadi: {url}")
 
-    if not audio_path or not os.path.exists(audio_path):
-        # Silent error - foydalanuvchiga minimal xatolik
-        logging.warning(f"[Select] Audio yuklash final xatosi: {uploader} - {title}")
-        await call.message.answer("⚠️ Musiqa hozircha mavjud emas. Boshqa qo'shiq tanlang.", reply_markup=build_share_kb())
-        return
+        if not audio_path or not os.path.exists(audio_path):
+            # Silent error - foydalanuvchiga minimal xatolik
+            logging.warning(f"[Select] Audio yuklash final xatosi: {uploader} - {title}")
+            await call.message.answer("⚠️ Musiqa hozircha mavjud emas. Boshqa qo'shiq tanlang.", reply_markup=build_share_kb())
+            return
 
-    # Fayl hajmi tekshirish
-    size_mb = os.path.getsize(audio_path) / (1024 * 1024)
-    if size_mb > MAX_SIZE_MB:
-        await call.message.answer(
-            TEXTS[lang]["file_too_large"].format(size_mb=f"{size_mb:.1f}", limit_mb=MAX_SIZE_MB)
+        # Fayl hajmi tekshirish
+        size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+        if size_mb > MAX_SIZE_MB:
+            await call.message.answer(
+                TEXTS[lang]["file_too_large"].format(size_mb=f"{size_mb:.1f}", limit_mb=MAX_SIZE_MB)
+            )
+            _cleanup_file(audio_path)
+            return
+
+        # Audio yuborish - varyantlar xabari o'chirilmaydi, faqat audio yuboriladi
+        await call.message.answer_audio(
+            audio=FSInputFile(audio_path),
+            title=title,
+            performer=uploader,
+            caption=SHARE_PROMO_CAPTION,
+            reply_markup=build_share_kb(),
         )
         _cleanup_file(audio_path)
-        return
-
-    # Audio yuborish - varyantlar xabari o'chirilmaydi, faqat audio yuboriladi
-    await call.message.answer_audio(
-        audio=FSInputFile(audio_path),
-        title=title,
-        performer=uploader,
-        caption=SHARE_PROMO_CAPTION,
-        reply_markup=build_share_kb(),
-    )
-    _cleanup_file(audio_path)
+    finally:
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
     # State saqlanadi - foydalanuvchi boshqa qo'shiqlarni ham tanlashi mumkin
 
 @router.callback_query(F.data.startswith("dl_music:"))
@@ -3643,6 +3649,10 @@ async def find_music_callback(call: CallbackQuery):
         if not query:
             await call.message.answer(TEXTS[lang]["not_recognized"])
             _cleanup_file(path)
+            try:
+                await loading_msg.delete()
+            except Exception:
+                pass
             return
 
     # YouTube orqali qidirish - loading xabarisiz
@@ -3838,6 +3848,7 @@ async def text_handler(message: Message):
 
     # LINK CHECK: Instagram, YouTube, TikTok, Likee, Threads, Pinterest, Snapchat
     if is_social_media_url(message.text):
+        status_msg = await message.answer(TEXTS[lang]["searching"])
         try:
             # URL'ni normalize qilish
             url_text = message.text.strip()
@@ -4019,6 +4030,11 @@ async def text_handler(message: Message):
             logging.error(f"Link download error: {e}")
             await message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
             return
+        finally:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
     # MUSIQA QIDIRUVI (YouTube orqali)
     query = message.text.strip()
@@ -4132,7 +4148,10 @@ async def process_audio_recognition(bot: Bot, file_id: str | None, user_id: int,
         # YouTube orqali qidirish
         youtube_results = await search_youtube_tracks(query, max_results=15)
 
-        await loading_msg.delete()
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
 
         if youtube_results:
             user_search_state[user_id] = {
@@ -4181,6 +4200,7 @@ async def voice_handler(message: Message):
         return
 
     try:
+        status_msg = await message.answer(TEXTS[lang]["searching"])
         file = await message.bot.get_file(message.voice.file_id)
         ext = file.file_path.split(".")[-1] if "." in file.file_path else "ogg"
         tmp_path = os.path.join(tempfile.gettempdir(), f"{message.from_user.id}_{datetime.now().timestamp():.0f}.{ext}")
@@ -4212,6 +4232,11 @@ async def voice_handler(message: Message):
     except Exception as e:
         logging.error(f"Voice handler error: {e}")
         await message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+    finally:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
 
 # ========================== AUDIO HANDLER ==========================
@@ -4226,6 +4251,7 @@ async def audio_handler(message: Message):
         return
 
     try:
+        status_msg = await message.answer(TEXTS[lang]["searching"])
         file = await message.bot.get_file(message.audio.file_id)
         ext = file.file_path.split(".")[-1] if "." in file.file_path else "mp3"
         tmp_path = os.path.join(tempfile.gettempdir(), f"{message.from_user.id}_{datetime.now().timestamp():.0f}.{ext}")
@@ -4257,6 +4283,11 @@ async def audio_handler(message: Message):
     except Exception as e:
         logging.error(f"Audio handler error: {e}")
         await message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+    finally:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
 # ========================== VIDEO HANDLER ==========================
 @router.message(F.video)
@@ -4270,6 +4301,7 @@ async def video_handler(message: Message):
         return
 
     try:
+        status_msg = await message.answer(TEXTS[lang]["searching"])
         file = await message.bot.get_file(message.video.file_id)
         ext = file.file_path.split(".")[-1] if "." in file.file_path else "mp4"
         tmp_path = os.path.join(tempfile.gettempdir(), f"{message.from_user.id}_{datetime.now().timestamp():.0f}.{ext}")
@@ -4301,6 +4333,11 @@ async def video_handler(message: Message):
     except Exception as e:
         logging.error(f"Video handler error: {e}")
         await message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+    finally:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
 
 # ========================== VIDEO NOTE HANDLER ==========================
@@ -4315,6 +4352,7 @@ async def video_note_handler(message: Message):
         return
 
     try:
+        status_msg = await message.answer(TEXTS[lang]["searching"])
         file = await message.bot.get_file(message.video_note.file_id)
         ext = file.file_path.split(".")[-1] if "." in file.file_path else "mp4"
         tmp_path = os.path.join(tempfile.gettempdir(), f"{message.from_user.id}_{datetime.now().timestamp():.0f}.{ext}")
@@ -4346,6 +4384,11 @@ async def video_note_handler(message: Message):
     except Exception as e:
         logging.error(f"Video note handler error: {e}")
         await message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
+    finally:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
 # ========================== PROFILE ==========================
 @router.callback_query(F.data == "profile")
