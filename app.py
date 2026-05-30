@@ -3299,7 +3299,11 @@ async def check_and_force_sub_group(message: Message, lang: str) -> bool:
             callback_data=f"check_sub_group:{message.from_user.id}:{message.message_id}"
         )
     ])
-    await message.reply(TEXTS[lang]["force_sub"], reply_markup=kb)
+    try:
+        await message.reply(TEXTS[lang]["force_sub"], reply_markup=kb)
+    except Exception as e:
+        # Agar bot guruhdan chiqarilgan bo'lsa yoki xato bo'lsa
+        logging.warning(f"[ForceSubGroup] Bot javob bera olmadi (bot chiqarilgan?): {e}")
     return False
 
 
@@ -4138,6 +4142,17 @@ async def photo_handler(message: Message):
         return
     await db.update_activity(message.from_user.id)
     lang = await get_lang(message.from_user.id)
+    
+    # Admin broadcast tekshirish
+    if message.from_user.id == ADMIN_ID and message.from_user.id in admin_state:
+        state_info = admin_state[message.from_user.id]
+        state = state_info.get("state")
+        
+        if state == "waiting_broadcast_media":
+            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption", "media_msg": message}
+            await message.answer(TEXTS["uz"]["broadcast_ask_caption"], reply_markup=broadcast_skip_caption_kb())
+            return
+    
     if not await check_and_force_sub_group(message, lang):
         return
     await message.answer(
@@ -4153,6 +4168,17 @@ async def document_handler(message: Message):
     await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
     if await db.is_blocked(message.from_user.id):
         return
+    
+    # Admin broadcast tekshirish
+    if message.from_user.id == ADMIN_ID and message.from_user.id in admin_state:
+        state_info = admin_state[message.from_user.id]
+        state = state_info.get("state")
+        
+        if state == "waiting_broadcast_media":
+            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption", "media_msg": message}
+            await message.answer(TEXTS["uz"]["broadcast_ask_caption"], reply_markup=broadcast_skip_caption_kb())
+            return
+    
     await db.update_activity(message.from_user.id)
     lang = await get_lang(message.from_user.id)
     if not await check_and_force_sub_group(message, lang):
@@ -4259,6 +4285,17 @@ async def voice_handler(message: Message):
     await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
     if await db.is_blocked(message.from_user.id):
         return
+    
+    # Admin broadcast tekshirish
+    if message.from_user.id == ADMIN_ID and message.from_user.id in admin_state:
+        state_info = admin_state[message.from_user.id]
+        state = state_info.get("state")
+        
+        if state == "waiting_broadcast_media":
+            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption", "media_msg": message}
+            await message.answer(TEXTS["uz"]["broadcast_ask_caption"], reply_markup=broadcast_skip_caption_kb())
+            return
+    
     await db.update_activity(message.from_user.id)
     lang = await get_lang(message.from_user.id)
     if not await check_and_force_sub_group(message, lang):
@@ -4310,6 +4347,17 @@ async def audio_handler(message: Message):
     await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
     if await db.is_blocked(message.from_user.id):
         return
+    
+    # Admin broadcast tekshirish
+    if message.from_user.id == ADMIN_ID and message.from_user.id in admin_state:
+        state_info = admin_state[message.from_user.id]
+        state = state_info.get("state")
+        
+        if state == "waiting_broadcast_media":
+            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption", "media_msg": message}
+            await message.answer(TEXTS["uz"]["broadcast_ask_caption"], reply_markup=broadcast_skip_caption_kb())
+            return
+    
     await db.update_activity(message.from_user.id)
     lang = await get_lang(message.from_user.id)
     if not await check_and_force_sub_group(message, lang):
@@ -4360,6 +4408,17 @@ async def video_handler(message: Message):
     await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
     if await db.is_blocked(message.from_user.id):
         return
+    
+    # Admin broadcast tekshirish
+    if message.from_user.id == ADMIN_ID and message.from_user.id in admin_state:
+        state_info = admin_state[message.from_user.id]
+        state = state_info.get("state")
+        
+        if state == "waiting_broadcast_media":
+            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption", "media_msg": message}
+            await message.answer(TEXTS["uz"]["broadcast_ask_caption"], reply_markup=broadcast_skip_caption_kb())
+            return
+    
     await db.update_activity(message.from_user.id)
     lang = await get_lang(message.from_user.id)
     if not await check_and_force_sub_group(message, lang):
@@ -4411,6 +4470,17 @@ async def video_note_handler(message: Message):
     await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
     if await db.is_blocked(message.from_user.id):
         return
+    
+    # Admin broadcast tekshirish
+    if message.from_user.id == ADMIN_ID and message.from_user.id in admin_state:
+        state_info = admin_state[message.from_user.id]
+        state = state_info.get("state")
+        
+        if state == "waiting_broadcast_media":
+            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption", "media_msg": message}
+            await message.answer(TEXTS["uz"]["broadcast_ask_caption"], reply_markup=broadcast_skip_caption_kb())
+            return
+    
     await db.update_activity(message.from_user.id)
     lang = await get_lang(message.from_user.id)
     if not await check_and_force_sub_group(message, lang):
