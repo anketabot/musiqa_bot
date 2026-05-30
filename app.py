@@ -4140,18 +4140,20 @@ async def photo_handler(message: Message):
     await db.add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
     if await db.is_blocked(message.from_user.id):
         return
-    await db.update_activity(message.from_user.id)
-    lang = await get_lang(message.from_user.id)
     
-    # Admin broadcast tekshirish
+    # Admin broadcast tekshirish — RASM reklama
     if message.from_user.id == ADMIN_ID and message.from_user.id in admin_state:
         state_info = admin_state[message.from_user.id]
         state = state_info.get("state")
         
-        if state == "waiting_broadcast_media":
-            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption", "media_msg": message}
+        # FIX: waiting_broadcast_photo ham tekshiriladi
+        if state in ("waiting_broadcast_media", "waiting_broadcast_photo"):
+            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption_photo", "media_msg": message}
             await message.answer(TEXTS["uz"]["broadcast_ask_caption"], reply_markup=broadcast_skip_caption_kb())
             return
+    
+    await db.update_activity(message.from_user.id)
+    lang = await get_lang(message.from_user.id)
     
     if not await check_and_force_sub_group(message, lang):
         return
@@ -4409,13 +4411,14 @@ async def video_handler(message: Message):
     if await db.is_blocked(message.from_user.id):
         return
     
-    # Admin broadcast tekshirish
+    # Admin broadcast tekshirish — VIDEO reklama
     if message.from_user.id == ADMIN_ID and message.from_user.id in admin_state:
         state_info = admin_state[message.from_user.id]
         state = state_info.get("state")
         
-        if state == "waiting_broadcast_media":
-            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption", "media_msg": message}
+        # FIX: waiting_broadcast_video ham tekshiriladi
+        if state in ("waiting_broadcast_media", "waiting_broadcast_video"):
+            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption_video", "media_msg": message}
             await message.answer(TEXTS["uz"]["broadcast_ask_caption"], reply_markup=broadcast_skip_caption_kb())
             return
     
