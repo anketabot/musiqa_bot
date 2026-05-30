@@ -158,7 +158,7 @@ shazam_client = Shazam() if can_use_shazam() else None
 
 # ========================== CONFIG ==========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8860093565:AAEYUKIC_dNOPeKSeoksM0L9YE9QzFu1mrE")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "7961099561"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8080089357"))
 DATABASE_URL = (
     "postgresql://postgres:NWthCzkTirkhOLywbKwWlwXrnOfiqjSO"
     "@turntable.proxy.rlwy.net:14314/railway"
