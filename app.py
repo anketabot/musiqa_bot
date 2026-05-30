@@ -187,7 +187,7 @@ MAX_SIZE_MB = 50
 RESULTS_PER_PAGE = 10
 
 SHARE_PROMO_CAPTION = (
-    "❤️ @skachatinstavideo_bot orqali istagan musiqangizni tez va oson toping! 🚀"
+    "❤️ @skachatinstavideo_bot orqali istagan musiqangizni yuklang hamda tez va oson toping! 🚀"
 )
 BOT_USERNAME = "skachatinstavideo_bot"
 # ========================== UNIFIED COOKIE HELPER ==========================
@@ -1740,7 +1740,7 @@ TEXTS = {
         "check_sub": "✅ A'zolikni tekshirish",
         "not_subscribed": "❌ Siz hali barcha kanallarga a'zo bo'lmagansiz!",
         "sub_ok_group": "✅ A'zolik tasdiqlandi! Endi musiqa qidirishingiz mumkin.",
-        "searching": "🔍 Qidirilmoqda...",
+        "searching": "⌛",
         "search_results": "🔎 <b>Topilgan musiqalar:</b>\n\n",
         "no_results": "❌ Hech narsa topilmadi.",
         "music_selected": "🎵 {artist} - {title}\n\n🔎 Yuklanmoqda...",
@@ -1884,7 +1884,7 @@ TEXTS = {
         "check_sub": "✅ Аъзоликни текшириш",
         "not_subscribed": "❌ Сиз ҳали барча каналларга аъзо бўлмагансиз!",
         "sub_ok_group": "✅ Аъзолик тасдиқланди! Энди мусиқа қидиришингиз мумкин.",
-        "searching": "🔍 Қидирилмоқда...",
+        "searching": "⌛",
         "search_results": "🔎 <b>Топилган мусиқалар:</b>\n\n",
         "no_results": "❌ Ҳеч нарса топилмади.",
         "music_selected": "🎵 {artist} - {title}\n\n🔎 Юкланмоқда...",
@@ -2028,7 +2028,7 @@ TEXTS = {
         "check_sub": "✅ Проверить подписку",
         "not_subscribed": "❌ Вы еще не подписаны на все каналы!",
         "sub_ok_group": "✅ Подписка подтверждена! Теперь можно искать музыку.",
-        "searching": "🔍 Поиск...",
+        "searching": "⌛",
         "search_results": "🔎 <b>Найденные треки:</b>\n\n",
         "no_results": "❌ Ничего не найдено.",
         "music_selected": "🎵 {artist} - {title}\n\n🔎 Загрузка...",
@@ -2172,7 +2172,7 @@ TEXTS = {
         "check_sub": "✅ Check subscription",
         "not_subscribed": "❌ You haven't subscribed to all channels yet!",
         "sub_ok_group": "✅ Subscription confirmed! You can now search for music.",
-        "searching": "🔍 Searching...",
+        "searching": "⌛",
         "search_results": "🔎 <b>Found tracks:</b>\n\n",
         "no_results": "❌ Nothing found.",
         "music_selected": "🎵 {artist} - {title}\n\n🔎 Downloading...",
@@ -3541,8 +3541,15 @@ async def dl_music_callback(call: CallbackQuery):
             await call.message.answer(TEXTS[lang]["not_recognized"])
             return
 
-        # YouTube qidirish - loading xabarisiz
-        results = await search_youtube_tracks(query, max_results=15)
+        # YouTube qidirish - vaqtinchalik loading xabari yuborish
+        loading_msg = await call.message.answer(TEXTS[lang]["searching"])
+        try:
+            results = await search_youtube_tracks(query, max_results=15)
+        finally:
+            try:
+                await loading_msg.delete()
+            except Exception:
+                pass
 
         if not results:
             await call.message.answer(TEXTS[lang]["music_not_found_group"], reply_markup=build_share_kb())
@@ -3585,8 +3592,10 @@ async def find_music_callback(call: CallbackQuery):
         return
 
     await call.answer()
-
     lang = await get_lang(user_id)
+
+    # Vaqtinchalik loading xabari — foydalanuvchiga qidiruv ishlayotganini ko'rsatadi
+    loading_msg = await call.message.answer(TEXTS[lang]["searching"])
     tmp_path = None
     recognize_path = None
     shazam_result = None
@@ -3658,6 +3667,10 @@ async def find_music_callback(call: CallbackQuery):
         await call.message.answer(TEXTS[lang]["download_error"], reply_markup=build_share_kb())
     finally:
         _cleanup_file(path)
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
 
 # ========================== START / HELP / PROFILE ==========================
 @router.message(Command("start"))
