@@ -1794,12 +1794,14 @@ TEXTS = {
         ),
         "broadcast_ask_text": "📨 Broadcast matnini yuboring:",
         "broadcast_ask_media": "📎 Broadcast uchun media yuboring (rasm, video, audio):",
+        "broadcast_ask_photo": "🖼 Broadcast uchun rasm yuboring:",
+        "broadcast_ask_video": "🎬 Broadcast uchun video yuboring:",
         "broadcast_ask_caption": (
             "📎 Media qabul qilindi.\n\n"
             "📝 Yozuv (caption) qo'shish uchun matn yuboring:\n"
-            "⏭️ O'tkazib yuborish uchun /skip deb yozing:"
+            "⏭️ Matnsiz yuborish uchun tugmani bosing:"
         ),
-        "broadcast_done": "✅ Xabar <b>{count}</b> ta foydalanuvchi va guruhga yuborildi.",
+        "broadcast_done": "✅ Reklama <b>{count}</b> ta foydalanuvchi/guruhga yuborildi.",
         "blocked": "🚫 Siz botdan bloklangansiz.",
         "blacklist_add": "🚫 Foydalanuvchi blocklandi.",
         "blacklist_remove": "✅ Foydalanuvchi blockdan chiqarildi.",
@@ -2626,8 +2628,11 @@ def broadcast_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="📝 Matn yuborish", callback_data="admin:bc_text"),
-                InlineKeyboardButton(text="📎 Media yuborish", callback_data="admin:bc_media"),
+                InlineKeyboardButton(text="📝 Matn", callback_data="admin:bc_text"),
+            ],
+            [
+                InlineKeyboardButton(text="🖼 Rasm", callback_data="admin:bc_photo"),
+                InlineKeyboardButton(text="🎬 Video", callback_data="admin:bc_video"),
             ],
             [InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:back")],
         ]
@@ -2637,7 +2642,8 @@ def broadcast_kb() -> InlineKeyboardMarkup:
 def broadcast_skip_caption_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⏭️ O'tkazib yuborish", callback_data="admin:bc_skip")],
+            [InlineKeyboardButton(text="⏭️ Matnsiz yuborish", callback_data="admin:bc_skip")],
+            [InlineKeyboardButton(text="🔙 Bekor qilish", callback_data="admin:broadcast")],
         ]
     )
 
@@ -3301,15 +3307,60 @@ async def check_and_force_sub_group(message: Message, lang: str) -> bool:
 async def broadcast_to_all(bot: Bot, msg: Message, caption: str | None = None):
     users = await db.get_all_users()
     groups = await db.get_groups()
+    mandatory_channels = await db.get_channels()
+    
+    # Majburiy kanallardagi username'larni set sifatida saqlash
+    mandatory_usernames = set()
+    for ch in mandatory_channels:
+        uname = ch["username"].lstrip("@").lower()
+        mandatory_usernames.add(uname)
+    
+    # Foydalanuvchilar (majburiy kanallar emas)
+    user_targets = [u["telegram_id"] for u in users]
+    
+    # Guruhlar va kanallar — majburiy kanallarni o'tkazib yuborish
+    group_targets = []
+    for g in groups:
+        gid = g["group_id"]
+        gtitle = (g.get("title") or "").lstrip("@").lower()
+        # Majburiy kanallar ro'yxatida bormi? (title yoki ID bo'yicha tekshiramiz)
+        # Kanal ID'si manfiy bo'ladi, guruh ham manfiy; lekin majburiy kanallar username bilan saqlanadi
+        # Shuning uchun title bo'yicha tekshiramiz
+        if gtitle in mandatory_usernames:
+            continue
+        group_targets.append(gid)
+    
     count = 0
-    targets = [u["telegram_id"] for u in users] + [g["group_id"] for g in groups]
-    for target_id in targets:
+    user_count = 0
+    group_count = 0
+    
+    all_targets = user_targets + group_targets
+    for target_id in all_targets:
         try:
             await msg.copy_to(target_id, caption=caption)
             count += 1
+            if target_id in user_targets:
+                user_count += 1
+            else:
+                group_count += 1
             await asyncio.sleep(0.05)
         except Exception:
             pass
+    
+    # Adminga xabar yuborish
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        admin_notify = (
+            f"✅ <b>Reklama yuborildi!</b>\n\n"
+            f"📊 Jami: <b>{count}</b> ta\n"
+            f"👤 Foydalanuvchilar: <b>{user_count}</b> ta\n"
+            f"👥 Guruh/Kanallar: <b>{group_count}</b> ta\n"
+            f"🕐 Vaqt: {now}"
+        )
+        await bot.send_message(ADMIN_ID, admin_notify)
+    except Exception:
+        pass
+    
     return count
 
 # ========================== ROUTER & HANDLERS ==========================
@@ -3806,16 +3857,30 @@ async def text_handler(message: Message):
             await message.answer(TEXTS["uz"]["broadcast_done"].format(count=count))
             await message.answer(TEXTS["uz"]["admin_welcome"], reply_markup=admin_main_kb())
             return
+        elif state == "waiting_broadcast_photo":
+            if not message.photo:
+                await message.answer("❌ Iltimos, rasm yuboring!")
+                return
+            # Rasmni saqlab, caption so'rash
+            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption_photo", "media_msg": message}
+            await message.answer(TEXTS["uz"]["broadcast_ask_caption"], reply_markup=broadcast_skip_caption_kb())
+            return
+        elif state == "waiting_broadcast_video":
+            if not message.video:
+                await message.answer("❌ Iltimos, video yuboring!")
+                return
+            # Videoni saqlab, caption so'rash
+            admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption_video", "media_msg": message}
+            await message.answer(TEXTS["uz"]["broadcast_ask_caption"], reply_markup=broadcast_skip_caption_kb())
+            return
         elif state == "waiting_broadcast_media":
             admin_state[message.from_user.id] = {"state": "waiting_broadcast_caption", "media_msg": message}
             await message.answer(TEXTS["uz"]["broadcast_ask_caption"], reply_markup=broadcast_skip_caption_kb())
             return
-        elif state == "waiting_broadcast_caption":
+        elif state in ("waiting_broadcast_caption", "waiting_broadcast_caption_photo", "waiting_broadcast_caption_video"):
             media_msg = admin_state[message.from_user.id].get("media_msg")
-            caption_text = message.text.strip() if message.text else ""
+            caption_text = message.text.strip() if message.text else None
             admin_state.pop(message.from_user.id, None)
-            if caption_text == "/skip":
-                caption_text = None
             if media_msg:
                 count = await broadcast_to_all(message.bot, media_msg, caption=caption_text)
                 await message.answer(TEXTS["uz"]["broadcast_done"].format(count=count))
@@ -4486,12 +4551,21 @@ async def admin_callbacks(call: CallbackQuery):
         await call.message.edit_text(TEXTS["uz"]["broadcast_ask_text"])
         admin_state[call.from_user.id] = {"state": "waiting_broadcast_text"}
 
+    elif action == "bc_photo":
+        await call.message.edit_text(TEXTS["uz"]["broadcast_ask_photo"])
+        admin_state[call.from_user.id] = {"state": "waiting_broadcast_photo"}
+
+    elif action == "bc_video":
+        await call.message.edit_text(TEXTS["uz"]["broadcast_ask_video"])
+        admin_state[call.from_user.id] = {"state": "waiting_broadcast_video"}
+
     elif action == "bc_media":
         await call.message.edit_text(TEXTS["uz"]["broadcast_ask_media"])
         admin_state[call.from_user.id] = {"state": "waiting_broadcast_media"}
 
     elif action == "bc_skip":
-        media_msg = admin_state.get(call.from_user.id, {}).get("media_msg")
+        state_info = admin_state.get(call.from_user.id, {})
+        media_msg = state_info.get("media_msg")
         admin_state.pop(call.from_user.id, None)
         if media_msg:
             count = await broadcast_to_all(call.bot, media_msg)
