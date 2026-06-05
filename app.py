@@ -5701,10 +5701,8 @@ async def round_media_callback(call: CallbackQuery):
             logging.error(f"[RoundVideo] {size_mb:.1f}MB > 12MB Telegram limiti")
             _cleanup_file(dst_path)
             await call.message.answer(
-                f"❌ Video note hajmi juda katta ({size_mb:.1f}MB).
-"
-                f"Telegram limiti: 12MB.
-"
+                f"❌ Video note hajmi juda katta ({size_mb:.1f}MB)."
+                f"Telegram limiti: 12MB."
                 f"Qisqa yoki kichikroq video yuboring."
             )
             return
