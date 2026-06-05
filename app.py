@@ -823,7 +823,7 @@ def convert_to_video_note(input_path: str, output_path: str) -> bool:
 
 
 def convert_to_video_note_hq(input_path: str, output_path: str) -> bool:
-    """HAqiqiy Telegram video note (240x240) - eng yaxshi sifat bilan"""
+    """Telegram video note (240x240) - 12MB limitini hisobga olib"""
     ffmpeg_cmd = find_ffmpeg_cmd()
     if not ffmpeg_cmd:
         logging.error("[VideoNoteHQ] FFmpeg topilmadi!")
@@ -836,41 +836,66 @@ def convert_to_video_note_hq(input_path: str, output_path: str) -> bool:
             size = min(w, h)
             x = (w - size) // 2
             y = (h - size) // 2
-            # Markazdan kesish -> 240x240
-            # Lanczos scaling - eng yaxshi sifat
-            # unsharp - biroz oqlash (tiniqroq)
             crop_filter = f"crop={size}:{size}:{x}:{y},scale=240:240:flags=lanczos,unsharp=3:3:0.5"
             logging.info(f"[VideoNoteHQ] Video {w}x{h} -> 240x240 (lanczos+unsharp)")
         else:
             crop_filter = "crop='min(iw,ih)':'min(iw,ih)',scale=240:240:flags=lanczos"
             logging.warning(f"[VideoNoteHQ] O'lcham aniqlanmadi, fallback ishlatilmoqda")
 
-        # YUQORI SIFAT uchun:
-        # -b:v 2M: Yuqori bitrate (2 Mbps) - 240x240 uchun juda yaxshi
-        # -maxrate 2M: Maksimal bitrate
-        # -bufsize 4M: Buffer hajmi
-        # -preset slow: Sifat optimallashtirish
-        # -profile:v high: Yuqori profil
-        # -refs 4: Reference frame
-        # lanczos: Eng yaxshi scaling
-        # unsharp: Tiniqlik
+        # Telegram limit: 12MB = 12,582,912 bytes
+        MAX_VIDEO_NOTE_BYTES = 12_582_912
+
+        # Video uzunligini aniqlash (60s limit)
+        duration = 0
+        try:
+            ffprobe_path = ffmpeg_cmd.replace('ffmpeg', 'ffprobe')
+            probe = subprocess.run(
+                [ffprobe_path, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "format=duration", "-of", "csv=p=0", input_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if probe.returncode == 0:
+                duration = float(probe.stdout.strip())
+        except Exception:
+            pass
+
+        # 60 soniyadan uzun bo'lsa kesish
+        duration_limit = 60
+        if duration > duration_limit:
+            duration = duration_limit
+
+        # Bitrate hisoblash: target_size = bitrate * duration / 8
+        # bitrate (bits/sec) = target_size * 8 / duration
+        # 80% hajm zaxirasi (audio + container overhead uchun)
+        target_size_bits = (MAX_VIDEO_NOTE_BYTES * 0.8) * 8
+        if duration > 0:
+            calculated_bitrate = int(target_size_bits / duration)
+            # Min/Max chegaralari
+            video_bitrate = max(300_000, min(calculated_bitrate, 1_500_000))  # 300K - 1.5M
+        else:
+            video_bitrate = 800_000  # default
+
+        audio_bitrate = min(128_000, max(64_000, video_bitrate // 4))  # video_bitrate ning 1/4 qismi
+
+        logging.info(f"[VideoNoteHQ] Target: {video_bitrate/1000:.0f}k video, {audio_bitrate/1000:.0f}k audio, max {duration}s")
+
         cmd = [
             ffmpeg_cmd, "-y", "-i", input_path,
             "-vf", crop_filter,
             "-c:v", "libx264",
-            "-b:v", "2M",           # Yuqori bitrate (2 Mbps)
-            "-maxrate", "2M",       # Maksimal bitrate
-            "-bufsize", "4M",       # Buffer
-            "-preset", "slow",      # Sifat uchun
-            "-profile:v", "high",  # Yuqori profil
-            "-level", "4.1",
-            "-refs", "4",           # Reference frames
+            "-b:v", f"{video_bitrate}",
+            "-maxrate", f"{int(video_bitrate * 1.2)}",
+            "-bufsize", f"{video_bitrate * 2}",
+            "-preset", "fast",  # "slow" o'rniga "fast" - tezroq va kichikroq
+            "-profile:v", "baseline",  # "high" o'rniga "baseline" - kichikroq
+            "-level", "3.0",
+            "-refs", "2",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             "-c:a", "aac",
-            "-b:a", "192k",         # Yuqori ovoz sifati
-            "-ar", "48000",
-            "-t", "60",            # Maks 60 sekund
+            "-b:a", f"{audio_bitrate}",
+            "-ar", "44100",
+            "-t", str(duration_limit),
             output_path,
         ]
 
@@ -878,13 +903,31 @@ def convert_to_video_note_hq(input_path: str, output_path: str) -> bool:
         if result.returncode != 0:
             logging.error(f"[VideoNoteHQ] FFmpeg xatosi: {result.stderr[:500]}")
             return False
+
         if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
             logging.error("[VideoNoteHQ] Output fayl yaratilmadi yoki juda kichik")
             return False
 
         file_size = os.path.getsize(output_path)
-        logging.info(f"[VideoNoteHQ] Tayyor: 240x240, {file_size/(1024*1024):.1f}MB, bitrate=2M")
-        return True
+        logging.info(f"[VideoNoteHQ] Tayyor: 240x240, {file_size/(1024*1024):.1f}MB, bitrate={video_bitrate/1000:.0f}k")
+
+        # 12MB dan katta bo'lsa - qayta kompress qilish
+        if file_size > MAX_VIDEO_NOTE_BYTES:
+            logging.warning(f"[VideoNoteHQ] {file_size/(1024*1024):.1f}MB > 12MB limit, qayta kompress...")
+            # Yana kichikroq bitrate bilan
+            smaller_bitrate = int(video_bitrate * 0.6)
+            cmd[cmd.index("-b:v") + 1] = f"{smaller_bitrate}"
+            cmd[cmd.index("-maxrate") + 1] = f"{int(smaller_bitrate * 1.2)}"
+            cmd[cmd.index("-bufsize") + 1] = f"{smaller_bitrate * 2}"
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0 and os.path.exists(output_path):
+                new_size = os.path.getsize(output_path)
+                logging.info(f"[VideoNoteHQ] Qayta kompress: {new_size/(1024*1024):.1f}MB")
+                if new_size <= MAX_VIDEO_NOTE_BYTES:
+                    return True
+
+        return file_size <= MAX_VIDEO_NOTE_BYTES
 
     except Exception as e:
         logging.error(f"[VideoNoteHQ] FFmpeg xatosi: {e}")
@@ -950,33 +993,62 @@ def _get_video_dimensions(input_path: str, ffmpeg_cmd: str) -> tuple[int, int]:
     """Video o'lchamlarini aniqlash (ffprobe yoki ffmpeg)"""
     w, h = 0, 0
 
-    # ffprobe bilan
-    try:
-        ffprobe_path = ffmpeg_cmd.replace('ffmpeg', 'ffprobe')
-        probe = subprocess.run(
-            [ffprobe_path, "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height", "-of", "csv=p=0", input_path],
-            capture_output=True, text=True, timeout=10
-        )
-        if probe.returncode == 0:
-            dims = probe.stdout.strip().split(",")
-            if len(dims) == 2:
-                w, h = int(dims[0]), int(dims[1])
-                return w, h
-    except (FileNotFoundError, Exception):
-        pass
+    # ffprobe bilan - to'g'ri yo'lni topish
+    ffprobe_candidates = [
+        ffmpeg_cmd.replace('ffmpeg', 'ffprobe'),
+        ffmpeg_cmd.replace('ffmpeg.exe', 'ffprobe.exe'),
+        shutil.which("ffprobe"),
+        shutil.which("ffprobe.exe"),
+    ]
 
-    # ffmpeg fallback
+    ffprobe_path = None
+    for candidate in ffprobe_candidates:
+        if candidate and os.path.exists(candidate):
+            ffprobe_path = candidate
+            break
+
+    if ffprobe_path:
+        try:
+            probe = subprocess.run(
+                [ffprobe_path, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "csv=p=0", input_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if probe.returncode == 0:
+                dims = probe.stdout.strip().split(",")
+                if len(dims) == 2:
+                    try:
+                        w, h = int(dims[0]), int(dims[1])
+                        if w > 0 and h > 0:
+                            return w, h
+                    except ValueError:
+                        pass
+        except Exception as e:
+            logging.debug(f"[Dimensions] ffprobe xatosi: {e}")
+
+    # ffmpeg fallback - stderr dan o'qish
     try:
         probe = subprocess.run(
             [ffmpeg_cmd, "-i", input_path],
             capture_output=True, text=True, timeout=10
         )
-        m = re.search(r'(\d+)x(\d+)', probe.stderr)
-        if m:
-            w, h = int(m.group(1)), int(m.group(2))
-    except Exception:
-        pass
+        # Ko'proq patternlar
+        patterns = [
+            r'Stream.*Video.*\s(\d+)x(\d+)',
+            r'(\d+)x(\d+)',
+            r'Video:.*\s(\d+)x(\d+)',
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, probe.stderr)
+            if m:
+                try:
+                    w, h = int(m.group(1)), int(m.group(2))
+                    if w > 0 and h > 0:
+                        return w, h
+                except ValueError:
+                    pass
+    except Exception as e:
+        logging.debug(f"[Dimensions] ffmpeg fallback xatosi: {e}")
 
     return w, h
 
@@ -5611,7 +5683,7 @@ async def round_media_callback(call: CallbackQuery):
 
         logging.info(f"[RoundVideo] Yuklandi: {os.path.getsize(src_path)} bytes")
 
-        # HAqiqiy video note yaratish (240x240) - eng yaxshi sifat bilan
+        # Video note yaratish (240x240) - 12MB limitini hisobga olib
         success = convert_to_video_note_hq(src_path, dst_path)
         _cleanup_file(src_path)
 
@@ -5620,30 +5692,48 @@ async def round_media_callback(call: CallbackQuery):
             await call.message.answer(TEXTS[lang]["round_media_failed"])
             return
 
+        # TELEGRAM LIMIT TEKSHIRUVI (12MB)
+        MAX_VIDEO_NOTE_BYTES = 12_582_912
+        file_size = os.path.getsize(dst_path)
+        size_mb = file_size / (1024 * 1024)
+
+        if file_size > MAX_VIDEO_NOTE_BYTES:
+            logging.error(f"[RoundVideo] {size_mb:.1f}MB > 12MB Telegram limiti")
+            _cleanup_file(dst_path)
+            await call.message.answer(
+                f"❌ Video note hajmi juda katta ({size_mb:.1f}MB).
+"
+                f"Telegram limiti: 12MB.
+"
+                f"Qisqa yoki kichikroq video yuboring."
+            )
+            return
+
         # Duration aniqlash
         duration = 0
         try:
-            ffprobe_cmd = find_ffmpeg_cmd().replace('ffmpeg', 'ffprobe')
-            probe = subprocess.run(
-                [ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=duration", "-of", "csv=p=0", dst_path],
-                capture_output=True, text=True, timeout=10
-            )
-            if probe.returncode == 0:
-                duration = int(float(probe.stdout.strip()))
+            ffprobe_candidates = [
+                shutil.which("ffprobe"),
+                shutil.which("ffprobe.exe"),
+            ]
+            ffprobe_cmd = None
+            for c in ffprobe_candidates:
+                if c:
+                    ffprobe_cmd = c
+                    break
+
+            if ffprobe_cmd:
+                probe = subprocess.run(
+                    [ffprobe_cmd, "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=duration", "-of", "csv=p=0", dst_path],
+                    capture_output=True, text=True, timeout=10
+                )
+                if probe.returncode == 0:
+                    duration = int(float(probe.stdout.strip()))
         except Exception:
             pass
 
-        file_size = os.path.getsize(dst_path)
-        size_mb = file_size / (1024 * 1024)
         logging.info(f"[RoundVideo] Yuborilmoqda: {dst_path} ({duration}s, {size_mb:.1f}MB)")
-
-        # 20MB limit for video notes
-        if file_size > 20 * 1024 * 1024:
-            await call.message.answer(TEXTS[lang]["file_too_large"].format(
-                size_mb=f"{size_mb:.1f}", limit_mb=20
-            ))
-            return
 
         # HAqiqiy Telegram video note yuborish (dumaloq ko'rinadi)
         await call.message.answer_video_note(
@@ -5653,6 +5743,15 @@ async def round_media_callback(call: CallbackQuery):
         )
         await call.answer(TEXTS[lang]["round_media_ready"], show_alert=True)
 
+    except TelegramBadRequest as e:
+        if "too big" in str(e).lower():
+            logging.error(f"[RoundVideo] Telegram hajm limiti: {e}")
+            await call.message.answer(
+                "❌ Video note hajmi Telegram limitidan oshib ketdi (12MB)."
+                "Qisqa yoki kichikroq video yuboring."
+            )
+        else:
+            raise
     except Exception as e:
         logging.error(f"[RoundVideo] Umumiy xato: {e}", exc_info=True)
         await call.message.answer(TEXTS[lang]["round_media_failed"])
