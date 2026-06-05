@@ -242,6 +242,8 @@ PROXY_LIST_URLS = [
         "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt"
     ).split(",") if url.strip()
 ]
+PROXY_LIST = os.getenv("PROXY_LIST", "").strip()
+PROXY_LIST_FILE = os.getenv("PROXY_LIST_FILE", "").strip()
 PROXY_LIST_REFRESH_INTERVAL_MINUTES = int(os.getenv("PROXY_LIST_REFRESH_INTERVAL_MINUTES", "60"))
 PROXY_LIST_MAX_ENTRIES = int(os.getenv("PROXY_LIST_MAX_ENTRIES", "150"))
 
@@ -343,6 +345,18 @@ class ProxyRotationManager:
                 proxies.append(proxy)
         return proxies
 
+    def _load_local_file(self, path: str) -> str | None:
+        if not path:
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except FileNotFoundError:
+            logging.warning(f"[ProxyList] Local proxy file topilmadi: {path}")
+        except Exception as e:
+            logging.warning(f"[ProxyList] Local proxy file o'qishda xato: {path} -> {e}")
+        return None
+
     def refresh_proxies(self, force: bool = False) -> None:
         if not PROXY_LIST_ENABLED:
             return
@@ -357,12 +371,25 @@ class ProxyRotationManager:
                 continue
             candidate.extend(self._parse_url(url, content))
 
+        if PROXY_LIST:
+            candidate.extend(_extract_proxies_from_text(PROXY_LIST))
+
+        if PROXY_LIST_FILE:
+            file_content = self._load_local_file(PROXY_LIST_FILE)
+            if file_content:
+                if PROXY_LIST_FILE.lower().endswith('.json'):
+                    candidate.extend(_extract_proxies_from_json(json.loads(file_content)))
+                elif PROXY_LIST_FILE.lower().endswith('.csv'):
+                    candidate.extend(_extract_proxies_from_csv(file_content))
+                else:
+                    candidate.extend(_extract_proxies_from_text(file_content))
+
         candidate = [p for p in dict.fromkeys(candidate)]
         if candidate:
             self.proxies = candidate[:self.max_entries]
             self.current_index = 0
             self.last_refresh = now
-            logging.info(f"[ProxyList] {len(self.proxies)} proxy loaded from GitHub")
+            logging.info(f"[ProxyList] {len(self.proxies)} proxy yuklandi (remote+local)")
         else:
             logging.warning("[ProxyList] Proxy ro'yxati yuklanmadi; mavjud ro'yxat saqlanadi")
 
@@ -6312,11 +6339,18 @@ async def main():
         print("[CRITICAL]      PROXY_API_KEY=YOUR_API_KEY")
         print("[CRITICAL]      PROXY_API_FORMAT=http://{api_key}@proxy.provider.com:8000")
     else:
-        print("[CRITICAL]   1. .env ga YOUTUBE_PROXY qo'shish yoki PROXY_LIST_URLS orqali GitHub proxy manbalarini sozlash:")
+        print("[CRITICAL]   1. .env ga YOUTUBE_PROXY qo'shish yoki local/proxy list faylini sozlash:")
         print("[CRITICAL]      YOUTUBE_PROXY=http://proxy-ip:port")
+        print("[CRITICAL]   2. Yoki PROXY_LIST / PROXY_LIST_FILE orqali lokal proxy ro'yxatini kiriting")
+        print("[CRITICAL]      PROXY_LIST=socks5://host:port\n...\n")
+        print("[CRITICAL]      PROXY_LIST_FILE=/app/proxies.txt")
     if PROXY_LIST_ENABLED and PROXY_LIST_URLS:
         print("[CRITICAL]   ➜ GitHub proxy ro'yxati ham ishlaydi: PROXY_LIST_URLS")
         print(f"[CRITICAL]      {PROXY_LIST_URLS[0]}")
+    if PROXY_LIST:
+        print("[CRITICAL]   ➜ Local PROXY_LIST env ichidagi proxylar ham ishlaydi")
+    if PROXY_LIST_FILE:
+        print(f"[CRITICAL]   ➜ Local proxy fayl ishlaydi: {PROXY_LIST_FILE}")
     print("[CRITICAL]   2. Bot qayta ishga tushirish")
     print("[CRITICAL]   3. Logs'da 'Proxy qo'llanilmoqda' xabarini ko'rish")
     print("[CRITICAL]")
