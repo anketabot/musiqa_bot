@@ -171,7 +171,49 @@ DATABASE_URL = (
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 
 # YouTube proxy (ixtiyoriy)
-YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "")
+YOUTUBE_PROXY_RAW = os.getenv("YOUTUBE_PROXY", "").strip()
+PROXY_API_KEY = os.getenv("PROXY_API_KEY", "").strip()
+# Optional format string that can contain `{api_key}` to produce a proxy URL.
+# Example: PROXY_API_FORMAT=http://{api_key}@proxy.provider.com:8000
+PROXY_API_FORMAT = os.getenv("PROXY_API_FORMAT", "").strip()
+
+
+def _resolve_youtube_proxy(raw: str, api_key: str, api_format: str) -> str:
+    """Resolve effective YOUTUBE_PROXY using either raw value, a formatted
+    proxy built from an API key, or simple heuristics.
+
+    Priority:
+    1. If `raw` is set, use it as-is.
+    2. If `api_format` and `api_key` are set, return api_format.format(api_key=api_key).
+    3. If only `api_key` is set, try a few heuristics:
+       - If it already looks like a URL (contains '://'), return it.
+       - If it looks like host:port or hostname, prefix with 'http://'.
+    4. Otherwise return empty string.
+    """
+    if raw:
+        return raw
+
+    if api_format and api_key:
+        try:
+            return api_format.format(api_key=api_key)
+        except Exception:
+            logging.debug("[Proxy] PROXY_API_FORMAT formatting failed")
+
+    if api_key:
+        if "://" in api_key:
+            return api_key
+        # looks like host:port or ip:port or hostname
+        if ":" in api_key or api_key.count(".") >= 1:
+            return f"http://{api_key}"
+
+    return ""
+
+
+YOUTUBE_PROXY = _resolve_youtube_proxy(YOUTUBE_PROXY_RAW, PROXY_API_KEY, PROXY_API_FORMAT)
+if YOUTUBE_PROXY:
+    logging.info(f"[Proxy] YOUTUBE_PROXY o'rnatildi: {YOUTUBE_PROXY[:60]}")
+else:
+    logging.warning("[Proxy] YOUTUBE_PROXY aniqlanmadi yoki noto'g'ri format; proxy ishlatilmaydi.")
 # YouTube cookies fayli uchun maxsus yo‘l (agar qo‘lda eksport qilingan bo‘lsa)
 YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIE_FILE", "")
 
