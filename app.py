@@ -245,7 +245,7 @@ PROXY_LIST_URLS = [
 PROXY_LIST = os.getenv("PROXY_LIST", "").strip()
 PROXY_LIST_FILE = os.getenv("PROXY_LIST_FILE", "").strip()
 PROXY_LIST_REFRESH_INTERVAL_MINUTES = int(os.getenv("PROXY_LIST_REFRESH_INTERVAL_MINUTES", "60"))
-PROXY_LIST_MAX_ENTRIES = int(os.getenv("PROXY_LIST_MAX_ENTRIES", "150"))
+PROXY_LIST_MAX_ENTRIES = int(os.getenv("PROXY_LIST_MAX_ENTRIES", "1000"))
 
 
 def _normalize_proxy_url(value: str) -> str | None:
@@ -407,6 +407,21 @@ class ProxyRotationManager:
                 return proxy
         return None
 
+    def get_proxy_candidates(self, count: int = 100) -> list[str]:
+        if not PROXY_LIST_ENABLED:
+            return []
+        self.refresh_proxies()
+        if not self.proxies:
+            return []
+        candidates = []
+        total = len(self.proxies)
+        for _ in range(min(count, total)):
+            proxy = self.proxies[self.current_index]
+            self.current_index = (self.current_index + 1) % total
+            if proxy not in self.blocked:
+                candidates.append(proxy)
+        return candidates
+
     def block_proxy(self, proxy: str) -> None:
         if proxy:
             self.blocked.add(proxy)
@@ -426,6 +441,65 @@ def get_current_proxy() -> str | None:
     if proxy:
         logging.info(f"[Proxy] GitHub proxy fallback ishlatilmoqda: {proxy[:60]}...")
     return proxy
+
+
+async def get_fast_proxy_for_youtube(url: str, max_proxies: int = 100, max_concurrency: int = 20, timeout_seconds: int = 5) -> str | None:
+    if not PROXY_LIST_ENABLED:
+        return get_current_proxy()
+
+    proxies = []
+    if YOUTUBE_PROXY and YOUTUBE_PROXY not in proxy_list_manager.blocked:
+        proxies.append(YOUTUBE_PROXY)
+    proxies.extend(proxy_list_manager.get_proxy_candidates(max_proxies))
+    proxies = [p for i, p in enumerate(proxies) if p and p not in proxies[:i]]
+    if not proxies:
+        return get_current_proxy()
+
+    probe_url = url
+    if "youtube" not in url.lower() and "youtu.be" not in url.lower():
+        probe_url = "https://www.youtube.com/"
+
+    connector = aiohttp.TCPConnector(ssl=False, limit=0)
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def probe(proxy: str, session: aiohttp.ClientSession) -> str | None:
+        async with semaphore:
+            try:
+                async with session.get(
+                    probe_url,
+                    timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    },
+                    proxy=proxy,
+                ) as response:
+                    if response.status in (200, 301, 302, 403, 429):
+                        logging.info(f"[Proxy] Quick test successful: {proxy[:40]}...")
+                        return proxy
+            except Exception as e:
+                logging.debug(f"[Proxy] Quick test failed for {proxy[:40]}...: {e}")
+                proxy_list_manager.block_proxy(proxy)
+            return None
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [asyncio.create_task(probe(proxy, session)) for proxy in proxies]
+    try:
+        for future in asyncio.as_completed(tasks, timeout=timeout_seconds * 2):
+            try:
+                result = await future
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                continue
+            if result:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                return result
+    except asyncio.TimeoutError:
+        pass
+    return get_current_proxy()
 
 
 def mark_proxy_blocked(proxy: str | None) -> None:
@@ -4262,6 +4336,13 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
     Pinterest'da video topilmasa rasm yuklaydi (fallback).
     """
 
+    # YouTube uchun tezky proxy tanlash
+    best_fast_proxy: str | None = None
+    if "youtube" in url.lower() or "youtu.be" in url.lower():
+        best_fast_proxy = await get_fast_proxy_for_youtube(url, max_proxies=100, max_concurrency=20, timeout_seconds=4)
+        if best_fast_proxy:
+            logging.info(f"[Video] Fast proxy tanlandi: {best_fast_proxy[:50]}...")
+
     # ==================== PROXY SOZLAMALARI ====================
     # Proxy ni yoqish/o'chirish - True/False
     USE_PROXY = True
@@ -4396,18 +4477,27 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
             return None
 
         # Har video uchun 8-10 xil proxy bilan urinish
-        max_proxy_attempts = 8
+        proxies_to_try: list[str | None] = [None]
+        if USE_PROXY:
+            if best_fast_proxy:
+                proxies_to_try = [best_fast_proxy]
+            current_proxy = get_current_proxy()
+            if current_proxy and current_proxy not in proxies_to_try:
+                proxies_to_try.append(current_proxy)
+            proxies_to_try.extend(proxy_list_manager.get_proxy_candidates(5))
+            if None not in proxies_to_try:
+                proxies_to_try.append(None)
+
         tried_proxies: set[str | None] = set()
-        
-        for proxy_attempt_num in range(max_proxy_attempts):
-            proxy = get_current_proxy()
+
+        for proxy_attempt_num, proxy in enumerate(proxies_to_try, start=1):
             if proxy in tried_proxies:
                 logging.debug(f"[Video] Proxy takrorlanayapti, tugating: {proxy[:40] if proxy else 'NONE'}")
-                break
+                continue
             tried_proxies.add(proxy)
 
             proxy_str = proxy[:30] + "..." if proxy and len(proxy) > 30 else (proxy or "Yo'q")
-            logging.info(f"[Video] Proxy attempt {proxy_attempt_num + 1}/{max_proxy_attempts}: {proxy_str}")
+            logging.info(f"[Video] Proxy attempt {proxy_attempt_num}/{len(proxies_to_try)}: {proxy_str}")
 
             # 1-urinish: Cookies SIZ, proxy bilan/yo'q
             result = _try_video_download("dl", use_cookies=False, proxy_url=proxy)
@@ -4442,7 +4532,7 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
 
             if proxy:
                 mark_proxy_blocked(proxy)
-        
+
         return None, None
 
     result = await asyncio.to_thread(_download)
