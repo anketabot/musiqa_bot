@@ -186,29 +186,43 @@ def _resolve_youtube_proxy(raw: str, api_key: str, api_format: str) -> str:
     proxy built from an API key, or simple heuristics.
 
     Priority:
-    1. If `raw` is set, use it as-is.
+    1. If `raw` is a valid proxy URL or host:port value, use it.
     2. If `api_format` and `api_key` are set, return api_format.format(api_key=api_key).
-    3. If only `api_key` is set, try a few heuristics:
-       - If it already looks like a URL (contains '://'), return it.
-       - If it looks like host:port or hostname, prefix with 'http://'.
-    4. Otherwise return empty string.
+    3. If only `api_key` is set and it already looks like a proxy URL/host:port, use it.
+    4. Otherwise return empty string so GitHub proxy fallback can be used.
     """
+    def _normalize_proxy_candidate(value: str) -> str | None:
+        if not value:
+            return None
+        candidate = value.strip().split()[0]
+        if not candidate or candidate.startswith("#"):
+            return None
+        if candidate.startswith(("http://", "https://", "socks5://", "socks5h://", "socks4://", "socks4a://")):
+            return candidate
+        if re.match(r"^(?:[^:@\s]+(?::[^:@\s]*)?@)?[^:@\s]+:\d+$", candidate):
+            return f"http://{candidate}"
+        return None
+
     if raw:
-        return raw
+        normalized_raw = _normalize_proxy_candidate(raw)
+        if normalized_raw:
+            return normalized_raw
+        logging.debug("[Proxy] YOUTUBE_PROXY is set but not a valid proxy URL; ignoring it and falling back.")
 
     if api_format and api_key:
         try:
-            return api_format.format(api_key=api_key)
+            formatted = api_format.format(api_key=api_key)
+            normalized_formatted = _normalize_proxy_candidate(formatted)
+            if normalized_formatted:
+                return normalized_formatted
+            logging.debug("[Proxy] PROXY_API_FORMAT produced invalid proxy URL.")
         except Exception:
             logging.debug("[Proxy] PROXY_API_FORMAT formatting failed")
 
     if api_key:
-        if "://" in api_key:
-            return api_key
-        # looks like host:port or ip:port or hostname
-        if ":" in api_key or api_key.count(".") >= 1:
-            return f"http://{api_key}"
-        # API key faqat kalit bo'lsa, PROXY_API_FORMAT talab qilinadi
+        normalized_key = _normalize_proxy_candidate(api_key)
+        if normalized_key:
+            return normalized_key
         logging.debug("[Proxy] PROXY_API_KEY mavjud, lekin uning formatini aniqlashning iloji yo'q. PROXY_API_FORMAT kerak.")
 
     return ""
@@ -381,7 +395,10 @@ proxy_list_manager = ProxyRotationManager(PROXY_LIST_URLS, PROXY_LIST_REFRESH_IN
 def get_current_proxy() -> str | None:
     if YOUTUBE_PROXY and YOUTUBE_PROXY not in proxy_list_manager.blocked:
         return YOUTUBE_PROXY
-    return proxy_list_manager.get_next_proxy()
+    proxy = proxy_list_manager.get_next_proxy()
+    if proxy:
+        logging.info(f"[Proxy] GitHub proxy fallback ishlatilmoqda: {proxy[:60]}...")
+    return proxy
 
 
 def mark_proxy_blocked(proxy: str | None) -> None:
@@ -1936,22 +1953,17 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
     """
     YouTube audio yuklash — yt-dlp cookie-free clients bilan urinish (PROXY BILAN OPTIMIZED).
     Bu funksiya YOUTUBE_PROXY dan foydalanib anonim clientlar orqali ishlaydi.
-    Agar bu muvaffaqiyatsiz bo'lsa, keyingi stage fresh cookies fallback larni sinaydi.
+    Har video uchun bir necha proxy bilan urinadi (dynamic rotation).
     
     OPTIMIZED FEATURES:
-    - Proxy support: YOUTUBE_PROXY env variable
+    - Multi-proxy rotation: 10+ proxies per download attempt
     - 7 ta cookie-free client: android_vr (best), tv_embedded, web_creator, mweb, ios, android, web_safari
     - Enhanced timeouts: 40s socket, 7x retries
     - Fragment retries: 7x for robust streaming
+    - Dynamic proxy from GitHub list (3000+ proxies, refreshes hourly)
     """
     safe = re.sub(r'[\\/*?:"<>|]', "_", filename)
     ffmpeg_cmd = find_ffmpeg_cmd()
-    
-    proxy = get_current_proxy()
-    if proxy:
-        logging.info(f"[Audio] Proxy qo'llanilmoqda: {proxy[:30]}...")
-    else:
-        logging.warning("[Audio] ⚠️ Hech qanday proxy topilmadi! Direct connection ishlatilmoqda.")
 
     # Priority: best performers first
     clients = [
@@ -1964,13 +1976,17 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
         ("web_safari", "web_safari"),       # ← Backup
     ]
 
+    # Har video uchun 10-15 xil proxy bilan urinish
+    max_proxy_attempts = 12
     tried_proxies: set[str | None] = set()
-    while True:
+    
+    for proxy_attempt_num in range(max_proxy_attempts):
         proxy = get_current_proxy()
         if proxy in tried_proxies:
+            logging.debug(f"[Audio] Proxy takrorlanayapti, tugating: {proxy[:40] if proxy else 'NONE'}")
             break
         tried_proxies.add(proxy)
-        logging.info(f"[Audio] yt-dlp proxy: {proxy[:40] if proxy else 'NONE'}...")
+        logging.info(f"[Audio] Proxy attempt {proxy_attempt_num + 1}/{max_proxy_attempts}: {proxy[:40] if proxy else 'NONE'}...")
 
         for client_name, client_val in clients:
             output_path = os.path.join(tempfile.gettempdir(), f"dl_{client_name}_{safe}.%(ext)s")
@@ -2058,14 +2074,13 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
                 continue
 
         else:
+            # All clients failed for this proxy
             if proxy:
-                logging.warning(f"[Audio] yt-dlp proxy {proxy[:40]} barcha clientlar uchun ishlamadi, rotatsiya qilinmoqda...")
+                logging.warning(f"[Audio] yt-dlp proxy {proxy[:40]} barcha clientlar uchun ishlamadi")
                 mark_proxy_blocked(proxy)
             continue
 
-        continue
-
-    logging.warning(f"[Audio] yt-dlp cookie-free clients (7 ta) natija bermadi, fresh cookies qo'llaniladi...")
+    logging.warning(f"[Audio] yt-dlp cookie-free clients ({max_proxy_attempts} ta proxy sinandi) natija bermadi, fresh cookies qo'llaniladi...")
     return None
 
 
@@ -2194,13 +2209,17 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
 
     # ===== ALL FAILED =====
     logging.error(f"[Audio] ❌ BARCHA 5 STAGE ISHLAMADI: {url}")
-    logging.error(f"[Audio] 📋 PROXY KONFIGURATSIYA:")
-    logging.error(f"[Audio]    YOUTUBE_PROXY qiymati: {YOUTUBE_PROXY if YOUTUBE_PROXY else '❌ BO\'SH (ENV ichida O\'RNATISH KERAK)'}")
-    logging.error(f"[Audio]    Format: http://proxy-server:port YOKI socks5://server:port")
-    logging.error(f"[Audio] 💡 .env fayliga qo\'shish:")
-    logging.error(f"[Audio]    YOUTUBE_PROXY=http://your-proxy-ip:port")
-    logging.error(f"[Audio] 📝 COOKIES BILAN HAM URINING:")
-    logging.error(f"[Audio]    YouTube cookies'ni chrome ichidan export qiling")
+    logging.error("[Audio] 📋 PROXY KONFIGURATSIYA:")
+    if YOUTUBE_PROXY:
+        logging.error("[Audio]    YOUTUBE_PROXY qiymati: %s", YOUTUBE_PROXY)
+    else:
+        logging.error("[Audio]    YOUTUBE_PROXY qiymati: ❌ BO'SH (ENV ichida O'RNATISH KERAK)")
+    logging.error("[Audio]    Format: http://proxy-server:port YOKI socks5://server:port")
+    logging.error("[Audio] 💡 .env fayliga qo'shish:")
+    logging.error("[Audio]    YOUTUBE_PROXY=http://your-proxy-ip:port")
+    logging.error("[Audio] 📝 COOKIES BILAN HAM URINING:")
+    logging.error("[Audio]    YouTube cookies'ni chrome ichidan export qiling")
+    logging.error("[Audio]    Keyin: python manage_cookies.py convert cookies.json")
     logging.error(f"[Audio]    Keyin: python manage_cookies.py convert cookies.json")
     return None
 
@@ -4220,25 +4239,6 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
     # Proxy ni yoqish/o'chirish - True/False
     USE_PROXY = True
 
-    # HTTP Proxy (agar kerak bo'lsa) - o'zingizning proxyingizni kiriting
-    # Format: "http://user:pass@host:port" yoki "http://host:port"
-    HTTP_PROXY = "http://user:pass@proxy_host:port"
-    HTTPS_PROXY = "http://user:pass@proxy_host:port"
-    SOCKS_PROXY = "socks5://user:pass@proxy_host:port"  # SOCKS5 proxy
-
-    # Tekshirilgan bepul proxy ro'yxati (ishlaydiganini tanlang)
-    # Eslatma: Bepul proxy tez-tez o'zgaradi, o'zingizning proxyingizni ishlating
-    # Webshare.io - 10 ta bepul proxy (ro'yxatdan o'tish kerak)
-    # Bright Data - 15 ta bepul proxy + 2GB/oy
-    FREE_PROXIES = [
-        None,  # Proxy siz (birinchi urinish)
-        # Quyidagilarni o'zingizning proxyingiz bilan almashtiring:
-        # "http://proxy1.example.com:8080",
-        # "http://proxy2.example.com:3128",
-        # "socks5://127.0.0.1:1080",  # Local SOCKS5 (masalan, Tor)
-    ]
-    # ==========================================================
-
     def _download():
         cookie_path = get_cookiefile()
 
@@ -4368,12 +4368,19 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
                 logging.warning(f"Video yuklashda xatolik ({prefix}, cookies={cookie_text}): {e}")
             return None
 
-        # Proxy bilan yuklash urinishlari
-        proxies_to_try = FREE_PROXIES if USE_PROXY else [None]
+        # Har video uchun 8-10 xil proxy bilan urinish
+        max_proxy_attempts = 8
+        tried_proxies: set[str | None] = set()
+        
+        for proxy_attempt_num in range(max_proxy_attempts):
+            proxy = get_current_proxy()
+            if proxy in tried_proxies:
+                logging.debug(f"[Video] Proxy takrorlanayapti, tugating: {proxy[:40] if proxy else 'NONE'}")
+                break
+            tried_proxies.add(proxy)
 
-        for proxy in proxies_to_try:
             proxy_str = proxy[:30] + "..." if proxy and len(proxy) > 30 else (proxy or "Yo'q")
-            logging.info(f"[TikTok] Proxy: {proxy_str}")
+            logging.info(f"[Video] Proxy attempt {proxy_attempt_num + 1}/{max_proxy_attempts}: {proxy_str}")
 
             # 1-urinish: Cookies SIZ, proxy bilan/yo'q
             result = _try_video_download("dl", use_cookies=False, proxy_url=proxy)
@@ -4406,6 +4413,9 @@ async def download_video(url: str) -> tuple[str | None, dict[str, Any] | None]:
             if result and result[0]:
                 return result
 
+            if proxy:
+                mark_proxy_blocked(proxy)
+        
         return None, None
 
     result = await asyncio.to_thread(_download)
@@ -6302,8 +6312,11 @@ async def main():
         print("[CRITICAL]      PROXY_API_KEY=YOUR_API_KEY")
         print("[CRITICAL]      PROXY_API_FORMAT=http://{api_key}@proxy.provider.com:8000")
     else:
-        print("[CRITICAL]   1. .env ga YOUTUBE_PROXY qo'shish:")
+        print("[CRITICAL]   1. .env ga YOUTUBE_PROXY qo'shish yoki PROXY_LIST_URLS orqali GitHub proxy manbalarini sozlash:")
         print("[CRITICAL]      YOUTUBE_PROXY=http://proxy-ip:port")
+    if PROXY_LIST_ENABLED and PROXY_LIST_URLS:
+        print("[CRITICAL]   ➜ GitHub proxy ro'yxati ham ishlaydi: PROXY_LIST_URLS")
+        print(f"[CRITICAL]      {PROXY_LIST_URLS[0]}")
     print("[CRITICAL]   2. Bot qayta ishga tushirish")
     print("[CRITICAL]   3. Logs'da 'Proxy qo'llanilmoqda' xabarini ko'rish")
     print("[CRITICAL]")
