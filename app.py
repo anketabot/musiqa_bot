@@ -10,7 +10,10 @@ import shutil
 import hashlib
 import base64
 import html
+import io
+import csv
 import time
+import urllib.request
 from datetime import datetime
 from typing import Any
 import dotenv
@@ -31,7 +34,7 @@ from aiogram.types import (
 )
 from aiogram.filters import Command
 from aiogram.enums import ChatMemberStatus, ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramConflictError, TelegramNetworkError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramConflictError, TelegramNetworkError
 from aiogram.client.default import DefaultBotProperties
 
 
@@ -205,6 +208,8 @@ def _resolve_youtube_proxy(raw: str, api_key: str, api_format: str) -> str:
         # looks like host:port or ip:port or hostname
         if ":" in api_key or api_key.count(".") >= 1:
             return f"http://{api_key}"
+        # API key faqat kalit bo'lsa, PROXY_API_FORMAT talab qilinadi
+        logging.debug("[Proxy] PROXY_API_KEY mavjud, lekin uning formatini aniqlashning iloji yo'q. PROXY_API_FORMAT kerak.")
 
     return ""
 
@@ -214,6 +219,181 @@ if YOUTUBE_PROXY:
     logging.info(f"[Proxy] YOUTUBE_PROXY o'rnatildi: {YOUTUBE_PROXY[:60]}")
 else:
     logging.warning("[Proxy] YOUTUBE_PROXY aniqlanmadi yoki noto'g'ri format; proxy ishlatilmaydi.")
+
+# Proxy list from GitHub / dynamic rotation
+PROXY_LIST_ENABLED = os.getenv("PROXY_LIST_ENABLED", "1").lower() in ("1", "true", "yes")
+PROXY_LIST_URLS = [
+    url.strip() for url in os.getenv(
+        "PROXY_LIST_URLS",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt"
+    ).split(",") if url.strip()
+]
+PROXY_LIST_REFRESH_INTERVAL_MINUTES = int(os.getenv("PROXY_LIST_REFRESH_INTERVAL_MINUTES", "60"))
+PROXY_LIST_MAX_ENTRIES = int(os.getenv("PROXY_LIST_MAX_ENTRIES", "150"))
+
+
+def _normalize_proxy_url(value: str) -> str | None:
+    if not value:
+        return None
+    proxy = value.strip().split()[0]
+    if not proxy or proxy.startswith("#"):
+        return None
+    if proxy.startswith(("http://", "https://", "socks5://", "socks5h://", "socks4://", "socks4a://")):
+        return proxy
+    # ip:port or user:pass@host:port
+    if re.match(r"^(?:[^:@\s]+(?::[^:@\s]*)?@)?[^:@\s]+:\d+$", proxy):
+        return f"http://{proxy}"
+    return None
+
+
+def _extract_proxies_from_json(data: Any) -> list[str]:
+    proxies: list[str] = []
+    if isinstance(data, str):
+        normalized = _normalize_proxy_url(data)
+        if normalized:
+            proxies.append(normalized)
+        return proxies
+    if isinstance(data, dict):
+        for value in data.values():
+            proxies.extend(_extract_proxies_from_json(value))
+        return proxies
+    if isinstance(data, list):
+        for item in data:
+            proxies.extend(_extract_proxies_from_json(item))
+        return proxies
+    return proxies
+
+
+def _extract_proxies_from_csv(text: str) -> list[str]:
+    proxies: list[str] = []
+    try:
+        import csv as _csv
+        import io as _io
+        reader = _csv.reader(_io.StringIO(text))
+        for row in reader:
+            for cell in row:
+                normalized = _normalize_proxy_url(cell)
+                if normalized:
+                    proxies.append(normalized)
+    except Exception:
+        pass
+    return proxies
+
+
+def _extract_proxies_from_text(text: str) -> list[str]:
+    proxies: list[str] = []
+    for line in text.splitlines():
+        normalized = _normalize_proxy_url(line)
+        if normalized:
+            proxies.append(normalized)
+    return proxies
+
+
+class ProxyRotationManager:
+    def __init__(self, urls: list[str], refresh_interval_minutes: int, max_entries: int):
+        self.urls = urls
+        self.refresh_interval = max(1, refresh_interval_minutes)
+        self.max_entries = max(10, max_entries)
+        self.proxies: list[str] = []
+        self.blocked: set[str] = set()
+        self.current_index = 0
+        self.last_refresh = 0.0
+
+    def _fetch_url(self, url: str) -> str | None:
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(url, timeout=20) as response:
+                if response.status != 200:
+                    return None
+                raw = response.read().decode('utf-8', errors='ignore')
+                return raw
+        except Exception as e:
+            logging.debug(f"[ProxyList] URL fetch failed: {url} -> {e}")
+            return None
+
+    def _parse_url(self, url: str, content: str) -> list[str]:
+        proxies: list[str] = []
+        lower_url = url.lower()
+        parsed: list[str] = []
+        if lower_url.endswith('.json') or content.strip().startswith('{') or content.strip().startswith('['):
+            try:
+                parsed = _extract_proxies_from_json(json.loads(content))
+            except Exception:
+                parsed = []
+        elif lower_url.endswith('.csv') or ',' in content.splitlines()[0] if content else False:
+            parsed = _extract_proxies_from_csv(content)
+        else:
+            parsed = _extract_proxies_from_text(content)
+        for proxy in parsed:
+            if proxy not in proxies:
+                proxies.append(proxy)
+        return proxies
+
+    def refresh_proxies(self, force: bool = False) -> None:
+        if not PROXY_LIST_ENABLED:
+            return
+        now = time.time()
+        if not force and self.proxies and (now - self.last_refresh) < self.refresh_interval * 60:
+            return
+
+        candidate: list[str] = []
+        for url in self.urls:
+            content = self._fetch_url(url)
+            if not content:
+                continue
+            candidate.extend(self._parse_url(url, content))
+
+        candidate = [p for p in dict.fromkeys(candidate)]
+        if candidate:
+            self.proxies = candidate[:self.max_entries]
+            self.current_index = 0
+            self.last_refresh = now
+            logging.info(f"[ProxyList] {len(self.proxies)} proxy loaded from GitHub")
+        else:
+            logging.warning("[ProxyList] Proxy ro'yxati yuklanmadi; mavjud ro'yxat saqlanadi")
+
+    def get_next_proxy(self) -> str | None:
+        if not PROXY_LIST_ENABLED:
+            return None
+        self.refresh_proxies()
+        if not self.proxies:
+            return None
+        total = len(self.proxies)
+        for _ in range(total):
+            proxy = self.proxies[self.current_index]
+            self.current_index = (self.current_index + 1) % total
+            if proxy not in self.blocked:
+                return proxy
+        return None
+
+    def block_proxy(self, proxy: str) -> None:
+        if proxy:
+            self.blocked.add(proxy)
+            logging.warning(f"[ProxyList] Blocked proxy: {proxy}")
+
+    def reset_blocked(self) -> None:
+        self.blocked.clear()
+
+
+proxy_list_manager = ProxyRotationManager(PROXY_LIST_URLS, PROXY_LIST_REFRESH_INTERVAL_MINUTES, PROXY_LIST_MAX_ENTRIES)
+
+
+def get_current_proxy() -> str | None:
+    if YOUTUBE_PROXY and YOUTUBE_PROXY not in proxy_list_manager.blocked:
+        return YOUTUBE_PROXY
+    return proxy_list_manager.get_next_proxy()
+
+
+def mark_proxy_blocked(proxy: str | None) -> None:
+    if not proxy:
+        return
+    if proxy == YOUTUBE_PROXY:
+        proxy_list_manager.blocked.add(proxy)
+        logging.warning(f"[Proxy] YOUTUBE_PROXY bloklandi: {proxy}")
+        return
+    proxy_list_manager.block_proxy(proxy)
+    logging.debug(f"[Proxy] Fallback proxy bloklandi: {proxy}")
+
 # YouTube cookies fayli uchun maxsus yo‘l (agar qo‘lda eksport qilingan bo‘lsa)
 YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIE_FILE", "")
 
@@ -1229,8 +1409,9 @@ def _search_ytdlp(query: str, max_results: int = 15) -> list:
             }
             if ffmpeg_cmd:
                 opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
-            if YOUTUBE_PROXY:
-                opts["proxy"] = YOUTUBE_PROXY
+            proxy = get_current_proxy()
+            if proxy:
+                opts["proxy"] = proxy
 
             # Fresh cookies qo'shish (agar kerak bo'lsa)
             fresh_cookie_file = None
@@ -1336,12 +1517,13 @@ async def probe_piped_instance(instance: str) -> bool:
     }
     connector = aiohttp.TCPConnector(ssl=False)
     try:
+        proxy = get_current_proxy()
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(
                 f"{instance}/streams/{probe_video_id}",
                 timeout=aiohttp.ClientTimeout(total=12),
                 headers=headers,
-                proxy=YOUTUBE_PROXY or None,
+                proxy=proxy,
             ) as resp:
                 if resp.status != 200:
                     return False
@@ -1396,6 +1578,7 @@ async def refresh_piped_instances(force: bool = False) -> list[str]:
 async def _get_piped_audio_url_instance(instance: str, video_id: str) -> tuple[str | None, dict | None]:
     connector = aiohttp.TCPConnector(ssl=False)
     try:
+        proxy = get_current_proxy()
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(
                 f"{instance}/streams/{video_id}",
@@ -1404,7 +1587,7 @@ async def _get_piped_audio_url_instance(instance: str, video_id: str) -> tuple[s
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "Accept": "application/json",
                 },
-                proxy=YOUTUBE_PROXY or None,
+                proxy=proxy,
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
@@ -1561,15 +1744,18 @@ async def download_piped_audio(audio_url: str, filename: str) -> str |None:
     }
 
     try:
+        proxy = get_current_proxy()
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 audio_url,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=120),
-                proxy=YOUTUBE_PROXY or None,
+                proxy=proxy,
             ) as response:
                 if response.status != 200:
                     logging.warning(f"[Piped] Yuklash xatosi: status {response.status}")
+                    if proxy and response.status in (403, 429, 500, 502, 503, 504):
+                        mark_proxy_blocked(proxy)
                     return None
 
                 content_type = response.headers.get("Content-Type", "").lower()
@@ -1629,11 +1815,12 @@ async def get_invidious_audio_url(video_id: str) -> tuple[str | None, dict | Non
         for instance in INVIDIOUS_INSTANCES:
             try:
                 api_url = f"{instance}/api/v1/videos/{video_id}"
+                proxy = get_current_proxy()
                 async with session.get(
                     api_url,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=10),
-                    proxy=YOUTUBE_PROXY or None,
+                    proxy=proxy,
                 ) as resp:
                     if resp.status != 200:
                         logging.debug(f"[Invidious] {instance} status {resp.status}")
@@ -1700,15 +1887,18 @@ async def download_invidious_audio(audio_url: str, filename: str) -> str | None:
     }
 
     try:
+        proxy = get_current_proxy()
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 audio_url,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=120),
-                proxy=YOUTUBE_PROXY or None,
+                proxy=proxy,
             ) as response:
                 if response.status != 200:
                     logging.warning(f"[Invidious] Yuklash xatosi: status {response.status}")
+                    if proxy and response.status in (403, 429, 500, 502, 503, 504):
+                        mark_proxy_blocked(proxy)
                     return None
 
                 content_type = response.headers.get("Content-Type", "").lower()
@@ -1757,10 +1947,11 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
     safe = re.sub(r'[\\/*?:"<>|]', "_", filename)
     ffmpeg_cmd = find_ffmpeg_cmd()
     
-    if YOUTUBE_PROXY:
-        logging.info(f"[Audio] Proxy qo'llanilmoqda: {YOUTUBE_PROXY[:30]}...")
+    proxy = get_current_proxy()
+    if proxy:
+        logging.info(f"[Audio] Proxy qo'llanilmoqda: {proxy[:30]}...")
     else:
-        logging.warning("[Audio] ⚠️ YOUTUBE_PROXY .env ichida o'rnatilmagan! Direct connection ishlatilmoqda.")
+        logging.warning("[Audio] ⚠️ Hech qanday proxy topilmadi! Direct connection ishlatilmoqda.")
 
     # Priority: best performers first
     clients = [
@@ -1773,85 +1964,106 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
         ("web_safari", "web_safari"),       # ← Backup
     ]
 
-    for client_name, client_val in clients:
-        output_path = os.path.join(tempfile.gettempdir(), f"dl_{client_name}_{safe}.%(ext)s")
-        opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best",
-            "outtmpl": output_path,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "ignoreerrors": False,
-            "socket_timeout": 40,        # ← Increased from 30
-            "retries": 7,                # ← Increased from 5
-            "fragment_retries": 7,       # ← Increased from 5
-            "file_access_retries": 5,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": [client_val],
-                    "player_skip": ["webpage", "js"],
-                    "formats": "missing_pot",
-                }
-            },
-            "headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate, br",
-                "DNT": "1",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-                "Priority": "u=1",
-            },
-            "geo_bypass": True,
-            "geo_bypass_country": "US",
-            "nocheckcertificate": True,
-            "cookiesfrombrowser": None,
-        }
+    tried_proxies: set[str | None] = set()
+    while True:
+        proxy = get_current_proxy()
+        if proxy in tried_proxies:
+            break
+        tried_proxies.add(proxy)
+        logging.info(f"[Audio] yt-dlp proxy: {proxy[:40] if proxy else 'NONE'}...")
 
-        if ffmpeg_cmd:
-            opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
-        if YOUTUBE_PROXY:
-            opts["proxy"] = YOUTUBE_PROXY
+        for client_name, client_val in clients:
+            output_path = os.path.join(tempfile.gettempdir(), f"dl_{client_name}_{safe}.%(ext)s")
+            opts = {
+                "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best",
+                "outtmpl": output_path,
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "ignoreerrors": False,
+                "socket_timeout": 40,
+                "retries": 7,
+                "fragment_retries": 7,
+                "file_access_retries": 5,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": [client_val],
+                        "player_skip": ["webpage", "js"],
+                        "formats": "missing_pot",
+                    }
+                },
+                "headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "DNT": "1",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Priority": "u=1",
+                },
+                "geo_bypass": True,
+                "geo_bypass_country": "US",
+                "nocheckcertificate": True,
+                "cookiesfrombrowser": None,
+            }
 
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if not info:
-                    logging.debug(f"[Audio] yt-dlp {client_name}: info bo'sh")
-                    continue
+            if ffmpeg_cmd:
+                opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
+            if proxy:
+                opts["proxy"] = proxy
 
-                downloaded = ydl.prepare_filename(info)
-                mp3_path = downloaded.rsplit(".", 1)[0] + ".mp3"
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if not info:
+                        logging.debug(f"[Audio] yt-dlp {client_name}: info bo'sh")
+                        continue
 
-                # MP3 file tekshirish
-                if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 2048:
-                    logging.info(f"[Audio] ✓ yt-dlp {client_name}: MUVAFFAQIYATLI (MP3)")
-                    return mp3_path
+                    downloaded = ydl.prepare_filename(info)
+                    mp3_path = downloaded.rsplit(".", 1)[0] + ".mp3"
 
-                # Original file tekshirish
-                if os.path.exists(downloaded) and os.path.getsize(downloaded) > 2048:
-                    logging.info(f"[Audio] ✓ yt-dlp {client_name}: MUVAFFAQIYATLI (format)")
-                    return downloaded
+                    if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 2048:
+                        logging.info(f"[Audio] ✓ yt-dlp {client_name}: MUVAFFAQIYATLI (MP3)")
+                        return mp3_path
 
-        except Exception as e:
-            err = str(e).lower()
-            error_type = _detect_youtube_error(str(e))
-            
-            if error_type in ("LOGIN_REQUIRED", "BOT_BLOCKED", "FORBIDDEN"):
-                logging.debug(f"[Audio] yt-dlp {client_name}: YouTube blocking ({error_type}), keyingiga o'tish...")
-            else:
-                logging.debug(f"[Audio] yt-dlp {client_name}: {str(e)[:80]}")
+                    if os.path.exists(downloaded) and os.path.getsize(downloaded) > 2048:
+                        logging.info(f"[Audio] ✓ yt-dlp {client_name}: MUVAFFAQIYATLI (format)")
+                        return downloaded
+
+            except Exception as e:
+                err = str(e).lower()
+                error_type = _detect_youtube_error(str(e))
+                if proxy and any(token in err for token in (
+                    "proxy", "timed out", "connection refused", "cannot connect", "failed to connect",
+                    "connection reset", "remote host", "proxy error"
+                )) or proxy and error_type in ("BOT_BLOCKED", "FORBIDDEN", "RATE_LIMIT", "BLOCKED", "UNAVAILABLE"):
+                    logging.warning(f"[Audio] yt-dlp proxy {proxy[:40]} ishlamadi: {error_type or err[:40]}. Next proxy... ")
+                    mark_proxy_blocked(proxy)
+                    break
+
+                if error_type in ("LOGIN_REQUIRED", "BOT_BLOCKED", "FORBIDDEN"):
+                    logging.debug(f"[Audio] yt-dlp {client_name}: YouTube blocking ({error_type}), keyingiga o'tish...")
+                else:
+                    logging.debug(f"[Audio] yt-dlp {client_name}: {str(e)[:80]}")
+                continue
+
+        else:
+            if proxy:
+                logging.warning(f"[Audio] yt-dlp proxy {proxy[:40]} barcha clientlar uchun ishlamadi, rotatsiya qilinmoqda...")
+                mark_proxy_blocked(proxy)
             continue
+
+        continue
 
     logging.warning(f"[Audio] yt-dlp cookie-free clients (7 ta) natija bermadi, fresh cookies qo'llaniladi...")
     return None
@@ -2026,7 +2238,7 @@ async def search_piped(query: str, max_results: int = 15) -> list:
     """
     Piped API orqali YouTube'dan qidirish - cookies kerak emas va PROXY BILAN ishlaydi.
     
-    Proxy: YOUTUBE_PROXY env variable dan ishlatiladi
+    Proxy: dynamic proxy pool / YOUTUBE_PROXY dan foydalanadi
     Timeouts: 15 sekund API request uchun
     Instances: Multiple Piped instances bilan fallback
     """
@@ -2034,6 +2246,7 @@ async def search_piped(query: str, max_results: int = 15) -> list:
     instances = WORKING_PIPED_INSTANCES or PIPED_API_INSTANCES
     connector = aiohttp.TCPConnector(ssl=False)
     
+    proxy = get_current_proxy()
     async with aiohttp.ClientSession(connector=connector) as session:
         for instance in instances:
             try:
@@ -2045,7 +2258,7 @@ async def search_piped(query: str, max_results: int = 15) -> list:
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                         "Accept": "application/json",
                     },
-                    proxy=YOUTUBE_PROXY or None,
+                    proxy=proxy,
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -2205,8 +2418,9 @@ def _download_youtube_audio_with_cookies(url: str, filename: str, cookiefile: st
     }
     if ffmpeg_cmd:
         opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
-    if YOUTUBE_PROXY:
-        opts["proxy"] = YOUTUBE_PROXY
+    proxy = get_current_proxy()
+    if proxy:
+        opts["proxy"] = proxy
 
     try:
         # Diagnostic: log cookie file usage
@@ -6076,8 +6290,20 @@ async def main():
     print("[CRITICAL]   5️⃣ Saved Cookies (last resort, proxy bilan)")
     print("[CRITICAL]")
     print("[CRITICAL] 🔧 SETUP:")
-    print("[CRITICAL]   1. .env ga YOUTUBE_PROXY qo'shish:")
-    print("[CRITICAL]      YOUTUBE_PROXY=http://proxy-ip:port")
+    if YOUTUBE_PROXY:
+        print("[CRITICAL]   1. .env ga YOUTUBE_PROXY qo'shish yoki to'g'ri sozlash:")
+        print(f"[CRITICAL]      YOUTUBE_PROXY={YOUTUBE_PROXY}")
+    elif PROXY_API_KEY and PROXY_API_FORMAT:
+        print("[CRITICAL]   1. .env ga PROXY_API_KEY va PROXY_API_FORMAT qo'shish:")
+        print("[CRITICAL]      PROXY_API_KEY=YOUR_API_KEY")
+        print("[CRITICAL]      PROXY_API_FORMAT=http://{api_key}@proxy.provider.com:8000")
+    elif PROXY_API_KEY:
+        print("[CRITICAL]   1. .env ga PROXY_API_KEY va PROXY_API_FORMAT qo'shish:")
+        print("[CRITICAL]      PROXY_API_KEY=YOUR_API_KEY")
+        print("[CRITICAL]      PROXY_API_FORMAT=http://{api_key}@proxy.provider.com:8000")
+    else:
+        print("[CRITICAL]   1. .env ga YOUTUBE_PROXY qo'shish:")
+        print("[CRITICAL]      YOUTUBE_PROXY=http://proxy-ip:port")
     print("[CRITICAL]   2. Bot qayta ishga tushirish")
     print("[CRITICAL]   3. Logs'da 'Proxy qo'llanilmoqda' xabarini ko'rish")
     print("[CRITICAL]")
