@@ -1,0 +1,6 @@
+# Backend build configuration
+[build]
+python = "3.12"
+
+[phases.setup]
+nixPkgs = ["ffmpeg", "ffprobe", "python312"]
