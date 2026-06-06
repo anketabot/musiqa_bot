@@ -572,9 +572,18 @@ def get_current_proxy(preferred_proxy: str | None = None) -> str | None:
     return proxy
 
 
-async def get_fast_proxy_for_youtube(url: str, max_proxies: int = 100, max_concurrency: int = 20, timeout_seconds: int = 5) -> str | None:
+async def get_fast_proxy_for_youtube(url: str, max_proxies: int = 20, max_concurrency: int = 10, timeout_seconds: int = 3) -> str | None:
     if not PROXY_LIST_ENABLED:
         return get_current_proxy()
+
+    if YOUTUBE_PROXY and YOUTUBE_PROXY not in proxy_list_manager.blocked:
+        logging.debug(f"[Proxy] YOUTUBE_PROXY fast path used: {YOUTUBE_PROXY[:60]}...")
+        return YOUTUBE_PROXY
+
+    best_cached = proxy_list_manager.get_best_proxy()
+    if best_cached and best_cached not in proxy_list_manager.blocked:
+        logging.debug(f"[Proxy] Cached best proxy fast path: {best_cached[:60]}...")
+        return best_cached
 
     proxies = []
     if YOUTUBE_PROXY and YOUTUBE_PROXY not in proxy_list_manager.blocked:
@@ -584,9 +593,7 @@ async def get_fast_proxy_for_youtube(url: str, max_proxies: int = 100, max_concu
     if not proxies:
         return get_current_proxy()
 
-    probe_url = url
-    if "youtube" not in url.lower() and "youtu.be" not in url.lower():
-        probe_url = "https://www.youtube.com/"
+    probe_url = "https://www.youtube.com/"
 
     connector = aiohttp.TCPConnector(ssl=False, limit=0)
     semaphore = asyncio.Semaphore(max_concurrency)
@@ -2214,13 +2221,10 @@ def download_youtube_audio_sync(url: str, filename: str, preferred_proxy: str | 
         ("tv_embedded", "tv_embedded"),      # ← Yaxshi
         ("web_creator", "web_creator"),      # ← Yaxshi
         ("mweb", "mweb"),                   # ← O'rtacha
-        ("ios", "ios"),                     # ← O'rtacha
-        ("android", "android"),             # ← O'rtacha
-        ("web_safari", "web_safari"),       # ← Backup
     ]
 
-    # Har video uchun 10-15 xil proxy bilan urinish
-    max_proxy_attempts = 12
+    # Har video uchun bir nechta tezkor proxy bilan urinish
+    max_proxy_attempts = 4
     tried_proxies: set[str | None] = set()
     
     for proxy_attempt_num in range(max_proxy_attempts):
@@ -2245,10 +2249,10 @@ def download_youtube_audio_sync(url: str, filename: str, preferred_proxy: str | 
                 "no_warnings": True,
                 "noplaylist": True,
                 "ignoreerrors": False,
-                "socket_timeout": 40,
-                "retries": 7,
-                "fragment_retries": 7,
-                "file_access_retries": 5,
+                "socket_timeout": 25,
+                "retries": 3,
+                "fragment_retries": 3,
+                "file_access_retries": 3,
                 "extractor_args": {
                     "youtube": {
                         "player_client": [client_val],
@@ -2342,7 +2346,7 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
     video_id = extract_youtube_video_id(url)
     best_fast_proxy: str | None = None
     if video_id:
-        best_fast_proxy = await get_fast_proxy_for_youtube(url, max_proxies=80, max_concurrency=16, timeout_seconds=4)
+        best_fast_proxy = await get_fast_proxy_for_youtube(url, max_proxies=20, max_concurrency=10, timeout_seconds=3)
         if best_fast_proxy:
             logging.info(f"[Audio] Fast proxy tanlandi: {best_fast_proxy[:60]}...")
 
@@ -2352,7 +2356,7 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
             logging.info("[Audio] Stage 1: Piped API (proxy bilan)...")
             audio_url, metadata = await asyncio.wait_for(
                 get_piped_audio_url(video_id, proxy_override=best_fast_proxy),
-                timeout=15.0
+                timeout=10.0
             )
             if audio_url:
                 safe_filename = filename or (metadata.get("title", video_id) if metadata else video_id)
@@ -2380,7 +2384,7 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
             logging.info("[Audio] Stage 2: Invidious API (YouTube zerkali)...")
             audio_url, metadata = await asyncio.wait_for(
                 get_invidious_audio_url(video_id, proxy_override=best_fast_proxy),
-                timeout=15.0
+                timeout=10.0
             )
             if audio_url:
                 safe_filename = filename or (metadata.get("title", video_id) if metadata else video_id)
@@ -2399,7 +2403,7 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
             logging.warning(f"[Audio] Invidious xatolik: {type(e).__name__}: {str(e)[:80]}")
 
     # ========== 3. YT-DLP COOKIE-FREE CLIENTS (PROXY BILAN) ==========
-    logging.warning(f"[Audio] Stage 3: yt-dlp cookie-free (7 clients, proxy bilan)...")
+    logging.warning(f"[Audio] Stage 3: yt-dlp cookie-free (4 clients, proxy bilan)...")
     audio_path = await asyncio.to_thread(download_youtube_audio_sync, url, filename, best_fast_proxy)
     if audio_path:
         logging.info(f"[Audio] ✓ MUVAFFAQIYATLI: yt-dlp cookie-free")
@@ -2407,15 +2411,15 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
     logging.warning("[Audio] yt-dlp cookie-free ishlamadi → Fresh cookies'ga o'tish...")
 
     # ========== 4. YT-DLP + FRESH COOKIES (PROXY BILAN ROTATION) ==========
-    logging.warning(f"[Audio] Stage 4: Fresh cookies x3 (proxy rotation, container deployment)...")
+    logging.warning(f"[Audio] Stage 4: Fresh cookies x2 (proxy rotation, container deployment)...")
     fresh_ok = 0
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
             fresh_cookie = await asyncio.to_thread(cookie_rotation_manager.create_fresh_cookie_file)
             if fresh_cookie and os.path.exists(fresh_cookie):
                 fresh_ok += 1
                 cookie_name = os.path.basename(fresh_cookie)
-                logging.info(f"[Audio] Fresh attempt {attempt}/3: {cookie_name} (proxy: {YOUTUBE_PROXY[:30] if YOUTUBE_PROXY else 'NONE'}...)")
+                logging.info(f"[Audio] Fresh attempt {attempt}/2: {cookie_name} (proxy: {YOUTUBE_PROXY[:30] if YOUTUBE_PROXY else 'NONE'}...)")
                 audio_path = await asyncio.to_thread(
                     _download_youtube_audio_with_cookies,
                     url,
