@@ -507,7 +507,7 @@ class ProxyRotationManager:
                 best_proxy = proxy
         if best_proxy:
             return best_proxy
-        return candidates[0] if candidates else None
+        return None
 
     async def monitor_proxies(self, probe_url: str = "https://www.youtube.com/", max_proxies: int = 10, timeout_seconds: int = 5) -> None:
         if not PROXY_LIST_ENABLED:
@@ -573,10 +573,16 @@ def get_current_proxy(preferred_proxy: str | None = None) -> str | None:
     if best:
         logging.info(f"[Proxy] Eng yaxshi proxy ishlatilmoqda: {best[:60]}...")
         return best
-    proxy = proxy_list_manager.get_next_proxy()
-    if proxy:
-        logging.info(f"[Proxy] Remote proxy pool ishlatilmoqda: {proxy[:60]}...")
-    return proxy
+
+    # Avoid using random, unproven proxies from the remote list unless one has passed a probe.
+    if proxy_list_manager.proxy_stats and any(stats.get("successes", 0) > 0 for stats in proxy_list_manager.proxy_stats.values()):
+        proxy = proxy_list_manager.get_next_proxy()
+        if proxy:
+            logging.info(f"[Proxy] Remote proxy pool ishlatilmoqda: {proxy[:60]}...")
+        return proxy
+
+    logging.info("[Proxy] Hozircha sinovdan o'tgan proxy yo'q; no-proxy rejimiga qaytish.")
+    return None
 
 
 async def get_fast_proxy_for_youtube(url: str, max_proxies: int = 20, max_concurrency: int = 10, timeout_seconds: int = 3) -> str | None:
