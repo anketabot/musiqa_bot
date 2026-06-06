@@ -159,6 +159,27 @@ def _schedule_auto_cookie_refresh():
     return asyncio.create_task(_worker())
 
 
+def _schedule_proxy_monitoring():
+    async def _worker():
+        if not PROXY_MONITOR_ENABLED:
+            logging.info("[ProxyMonitor] PROXY_MONITOR_ENABLED o'chirilgan")
+            return
+        interval = max(1, PROXY_MONITOR_INTERVAL_MINUTES) * 60
+        logging.info(f"[ProxyMonitor] Proxy monitoring scheduled every {PROXY_MONITOR_INTERVAL_MINUTES} minutes")
+        while True:
+            try:
+                await proxy_list_manager.monitor_proxies(
+                    probe_url="https://www.youtube.com/",
+                    max_proxies=min(PROXY_MONITOR_SAMPLE_COUNT, len(proxy_list_manager.proxies) or PROXY_MONITOR_SAMPLE_COUNT),
+                    timeout_seconds=PROXY_MONITOR_TIMEOUT_SECONDS,
+                )
+            except Exception as e:
+                logging.warning(f"[ProxyMonitor] Monitor xatosi: {e}")
+            await asyncio.sleep(interval)
+
+    return asyncio.create_task(_worker())
+
+
 shazam_client = Shazam() if can_use_shazam() else None
 
 # ========================== CONFIG ==========================
@@ -234,18 +255,22 @@ if YOUTUBE_PROXY:
 else:
     logging.warning("[Proxy] YOUTUBE_PROXY aniqlanmadi yoki noto'g'ri format; proxy ishlatilmaydi.")
 
-# Proxy list from GitHub / dynamic rotation
+# Proxy list sources for dynamic rotation
 PROXY_LIST_ENABLED = os.getenv("PROXY_LIST_ENABLED", "1").lower() in ("1", "true", "yes")
 PROXY_LIST_URLS = [
     url.strip() for url in os.getenv(
         "PROXY_LIST_URLS",
-        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt"
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all&ssl=all&anonymity=all,https://www.proxy-list.download/api/v1/get?type=http&anon=all"
     ).split(",") if url.strip()
 ]
 PROXY_LIST = os.getenv("PROXY_LIST", "").strip()
 PROXY_LIST_FILE = os.getenv("PROXY_LIST_FILE", "").strip()
 PROXY_LIST_REFRESH_INTERVAL_MINUTES = int(os.getenv("PROXY_LIST_REFRESH_INTERVAL_MINUTES", "60"))
 PROXY_LIST_MAX_ENTRIES = int(os.getenv("PROXY_LIST_MAX_ENTRIES", "1000"))
+PROXY_MONITOR_ENABLED = os.getenv("PROXY_MONITOR_ENABLED", "1").lower() in ("1", "true", "yes")
+PROXY_MONITOR_INTERVAL_MINUTES = int(os.getenv("PROXY_MONITOR_INTERVAL_MINUTES", "15"))
+PROXY_MONITOR_SAMPLE_COUNT = int(os.getenv("PROXY_MONITOR_SAMPLE_COUNT", "10"))
+PROXY_MONITOR_TIMEOUT_SECONDS = int(os.getenv("PROXY_MONITOR_TIMEOUT_SECONDS", "5"))
 
 
 def _normalize_proxy_url(value: str) -> str | None:
@@ -314,6 +339,7 @@ class ProxyRotationManager:
         self.blocked: set[str] = set()
         self.current_index = 0
         self.last_refresh = 0.0
+        self.proxy_stats: dict[str, dict[str, Any]] = {}
 
     def _fetch_url(self, url: str) -> str | None:
         try:
@@ -387,6 +413,7 @@ class ProxyRotationManager:
         candidate = [p for p in dict.fromkeys(candidate)]
         if candidate:
             self.proxies = candidate[:self.max_entries]
+            self.proxy_stats = {k: v for k, v in self.proxy_stats.items() if k in self.proxies}
             self.current_index = 0
             self.last_refresh = now
             logging.info(f"[ProxyList] {len(self.proxies)} proxy yuklandi (remote+local)")
@@ -427,6 +454,91 @@ class ProxyRotationManager:
             self.blocked.add(proxy)
             logging.warning(f"[ProxyList] Blocked proxy: {proxy}")
 
+    def record_proxy_result(self, proxy: str, success: bool, latency: float | None = None) -> None:
+        if not proxy:
+            return
+        stats = self.proxy_stats.setdefault(proxy, {
+            "probes": 0,
+            "successes": 0,
+            "failures": 0,
+            "latency_sum": 0.0,
+            "last_success": 0.0,
+            "last_failure": 0.0,
+        })
+        stats["probes"] += 1
+        if success:
+            stats["successes"] += 1
+            stats["last_success"] = time.time()
+            if latency is not None:
+                stats["latency_sum"] += latency
+        else:
+            stats["failures"] += 1
+            stats["last_failure"] = time.time()
+
+    def get_best_proxy(self) -> str | None:
+        if not self.proxies:
+            return None
+        candidates = [p for p in self.proxies if p not in self.blocked]
+        best_proxy = None
+        best_latency = float("inf")
+        for proxy in candidates:
+            stats = self.proxy_stats.get(proxy)
+            if not stats or stats.get("successes", 0) == 0:
+                continue
+            avg_latency = stats["latency_sum"] / stats["successes"]
+            if avg_latency < best_latency:
+                best_latency = avg_latency
+                best_proxy = proxy
+        if best_proxy:
+            return best_proxy
+        return candidates[0] if candidates else None
+
+    async def monitor_proxies(self, probe_url: str = "https://www.youtube.com/", max_proxies: int = 10, timeout_seconds: int = 5) -> None:
+        if not PROXY_LIST_ENABLED:
+            return
+        self.refresh_proxies()
+        proxies = [p for p in self.proxies if p not in self.blocked]
+        if not proxies:
+            return
+        proxies = proxies[:max_proxies]
+        connector = aiohttp.TCPConnector(ssl=False, limit=max_proxies)
+        semaphore = asyncio.Semaphore(max_proxies)
+
+        async def probe(proxy: str, session: aiohttp.ClientSession) -> None:
+            async with semaphore:
+                start = time.perf_counter()
+                try:
+                    async with session.get(
+                        probe_url,
+                        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                        },
+                        proxy=proxy,
+                    ) as response:
+                        elapsed = time.perf_counter() - start
+                        if response.status in (200, 301, 302):
+                            self.record_proxy_result(proxy, True, elapsed)
+                            logging.debug(f"[ProxyMonitor] {proxy[:40]} success {elapsed:.2f}s")
+                        elif response.status in (403, 429):
+                            self.record_proxy_result(proxy, False, elapsed)
+                            self.block_proxy(proxy)
+                        else:
+                            self.record_proxy_result(proxy, False, elapsed)
+                except Exception as e:
+                    self.record_proxy_result(proxy, False, None)
+                    self.block_proxy(proxy)
+                    logging.debug(f"[ProxyMonitor] {proxy[:40]} failed: {e}")
+
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks = [asyncio.create_task(probe(proxy, session)) for proxy in proxies]
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        best = self.get_best_proxy()
+        if best:
+            logging.info(f"[ProxyMonitor] Eng yaxshi proxy: {best[:60]}...")
+
     def reset_blocked(self) -> None:
         self.blocked.clear()
 
@@ -434,12 +546,18 @@ class ProxyRotationManager:
 proxy_list_manager = ProxyRotationManager(PROXY_LIST_URLS, PROXY_LIST_REFRESH_INTERVAL_MINUTES, PROXY_LIST_MAX_ENTRIES)
 
 
-def get_current_proxy() -> str | None:
+def get_current_proxy(preferred_proxy: str | None = None) -> str | None:
+    if preferred_proxy and preferred_proxy not in proxy_list_manager.blocked:
+        return preferred_proxy
     if YOUTUBE_PROXY and YOUTUBE_PROXY not in proxy_list_manager.blocked:
         return YOUTUBE_PROXY
+    best = proxy_list_manager.get_best_proxy()
+    if best:
+        logging.info(f"[Proxy] Eng yaxshi proxy ishlatilmoqda: {best[:60]}...")
+        return best
     proxy = proxy_list_manager.get_next_proxy()
     if proxy:
-        logging.info(f"[Proxy] GitHub proxy fallback ishlatilmoqda: {proxy[:60]}...")
+        logging.info(f"[Proxy] Remote proxy pool ishlatilmoqda: {proxy[:60]}...")
     return proxy
 
 
@@ -462,8 +580,9 @@ async def get_fast_proxy_for_youtube(url: str, max_proxies: int = 100, max_concu
     connector = aiohttp.TCPConnector(ssl=False, limit=0)
     semaphore = asyncio.Semaphore(max_concurrency)
 
-    async def probe(proxy: str, session: aiohttp.ClientSession) -> str | None:
+    async def probe(proxy: str, session: aiohttp.ClientSession) -> tuple[str, float] | None:
         async with semaphore:
+            start = time.perf_counter()
             try:
                 async with session.get(
                     probe_url,
@@ -474,31 +593,43 @@ async def get_fast_proxy_for_youtube(url: str, max_proxies: int = 100, max_concu
                     },
                     proxy=proxy,
                 ) as response:
-                    if response.status in (200, 301, 302, 403, 429):
-                        logging.info(f"[Proxy] Quick test successful: {proxy[:40]}...")
-                        return proxy
+                    elapsed = time.perf_counter() - start
+                    if response.status in (200, 301, 302):
+                        logging.info(f"[Proxy] Fast probe success: {proxy[:40]}... ({elapsed:.2f}s)")
+                        return proxy, elapsed
+                    if response.status in (403, 429):
+                        logging.warning(f"[Proxy] Fast probe blocked: {proxy[:40]}... status={response.status}")
+                        proxy_list_manager.block_proxy(proxy)
             except Exception as e:
-                logging.debug(f"[Proxy] Quick test failed for {proxy[:40]}...: {e}")
+                logging.debug(f"[Proxy] Fast probe failed for {proxy[:40]}...: {e}")
                 proxy_list_manager.block_proxy(proxy)
             return None
 
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [asyncio.create_task(probe(proxy, session)) for proxy in proxies]
-    try:
-        for future in asyncio.as_completed(tasks, timeout=timeout_seconds * 2):
-            try:
-                result = await future
-            except asyncio.CancelledError:
-                continue
-            except Exception:
-                continue
-            if result:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                return result
-    except asyncio.TimeoutError:
-        pass
+        successes: list[tuple[str, float]] = []
+        try:
+            for future in asyncio.as_completed(tasks, timeout=timeout_seconds * 2):
+                try:
+                    result = await future
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    continue
+                if result:
+                    successes.append(result)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+    if successes:
+        best_proxy = min(successes, key=lambda item: item[1])[0]
+        logging.info(f"[Proxy] Fastest proxy tanlandi: {best_proxy[:60]}...")
+        return best_proxy
+
     return get_current_proxy()
 
 
@@ -1693,10 +1824,10 @@ async def refresh_piped_instances(force: bool = False) -> list[str]:
 
 
 # ========================== PIPED AUDIO URL ==========================
-async def _get_piped_audio_url_instance(instance: str, video_id: str) -> tuple[str | None, dict | None]:
+async def _get_piped_audio_url_instance(instance: str, video_id: str, proxy_override: str | None = None) -> tuple[str | None, dict | None]:
     connector = aiohttp.TCPConnector(ssl=False)
     try:
-        proxy = get_current_proxy()
+        proxy = get_current_proxy(proxy_override)
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(
                 f"{instance}/streams/{video_id}",
@@ -1780,7 +1911,7 @@ async def _get_piped_audio_url_instance(instance: str, video_id: str) -> tuple[s
     return None, None
 
 
-async def get_piped_audio_url(video_id: str) -> tuple[str | None, dict | None]:
+async def get_piped_audio_url(video_id: str, proxy_override: str | None = None) -> tuple[str | None, dict | None]:
     instances = await refresh_piped_instances()
     if not instances:
         logging.warning("[Piped] Hoziroq ishlaydigan instancelar topilmadi, barcha kandidatlardan qayta tekshirilyapti...")
@@ -1795,7 +1926,7 @@ async def get_piped_audio_url(video_id: str) -> tuple[str | None, dict | None]:
         return None, None
     logging.info(f"[Piped] Urinish qilinmoqda — instancelar: {instances}")
     tasks = {
-        asyncio.create_task(_get_piped_audio_url_instance(instance, video_id)): instance
+        asyncio.create_task(_get_piped_audio_url_instance(instance, video_id, proxy_override)): instance
         for instance in instances
     }
     try:
@@ -1833,7 +1964,7 @@ async def get_piped_audio_url(video_id: str) -> tuple[str | None, dict | None]:
     for candidate in PIPED_API_INSTANCES:
         try:
             logging.info(f"[Piped] On-demand sinov: {candidate} -> {video_id}")
-            audio_url, metadata = await _get_piped_audio_url_instance(candidate, video_id)
+            audio_url, metadata = await _get_piped_audio_url_instance(candidate, video_id, proxy_override)
             if audio_url:
                 # promote this candidate to working list
                 async with PIPED_INSTANCE_LOCK:
@@ -1849,7 +1980,7 @@ async def get_piped_audio_url(video_id: str) -> tuple[str | None, dict | None]:
 
 
 # ========================== DOWNLOAD PIPED AUDIO ==========================
-async def download_piped_audio(audio_url: str, filename: str) -> str |None:
+async def download_piped_audio(audio_url: str, filename: str, proxy_override: str | None = None) -> str |None:
     """
     Piped audio stream URL dan fayl yuklash.
     """
@@ -1862,7 +1993,7 @@ async def download_piped_audio(audio_url: str, filename: str) -> str |None:
     }
 
     try:
-        proxy = get_current_proxy()
+        proxy = get_current_proxy(proxy_override)
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 audio_url,
@@ -1921,7 +2052,7 @@ INVIDIOUS_INSTANCES = [
     "https://iv.melmac.space",
 ]
 
-async def get_invidious_audio_url(video_id: str) -> tuple[str | None, dict | None]:
+async def get_invidious_audio_url(video_id: str, proxy_override: str | None = None) -> tuple[str | None, dict | None]:
     """Invidious API orqali audio stream URL olish - cookies kerak emas"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -1933,7 +2064,7 @@ async def get_invidious_audio_url(video_id: str) -> tuple[str | None, dict | Non
         for instance in INVIDIOUS_INSTANCES:
             try:
                 api_url = f"{instance}/api/v1/videos/{video_id}"
-                proxy = get_current_proxy()
+                proxy = get_current_proxy(proxy_override)
                 async with session.get(
                     api_url,
                     headers=headers,
@@ -1994,7 +2125,7 @@ async def get_invidious_audio_url(video_id: str) -> tuple[str | None, dict | Non
     return None, None
 
 
-async def download_invidious_audio(audio_url: str, filename: str) -> str | None:
+async def download_invidious_audio(audio_url: str, filename: str, proxy_override: str | None = None) -> str | None:
     """Invidious audio stream dan fayl yuklash"""
     safe = re.sub(r'[\\/*?:"<>|]', "_", filename)
     output_path = os.path.join(tempfile.gettempdir(), f"invidious_{safe}.mp3")
@@ -2005,7 +2136,7 @@ async def download_invidious_audio(audio_url: str, filename: str) -> str | None:
     }
 
     try:
-        proxy = get_current_proxy()
+        proxy = get_current_proxy(proxy_override)
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 audio_url,
@@ -2050,7 +2181,7 @@ async def download_invidious_audio(audio_url: str, filename: str) -> str | None:
 
 
 # ========================== YT-DLP FALLBACK (COOKIE-FREE) ==========================
-def download_youtube_audio_sync(url: str, filename: str) -> str | None:
+def download_youtube_audio_sync(url: str, filename: str, preferred_proxy: str | None = None) -> str | None:
     """
     YouTube audio yuklash — yt-dlp cookie-free clients bilan urinish (PROXY BILAN OPTIMIZED).
     Bu funksiya YOUTUBE_PROXY dan foydalanib anonim clientlar orqali ishlaydi.
@@ -2061,7 +2192,7 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
     - 7 ta cookie-free client: android_vr (best), tv_embedded, web_creator, mweb, ios, android, web_safari
     - Enhanced timeouts: 40s socket, 7x retries
     - Fragment retries: 7x for robust streaming
-    - Dynamic proxy from GitHub list (3000+ proxies, refreshes hourly)
+    - Dynamic proxy from remote lists, refreshes hourly
     """
     safe = re.sub(r'[\\/*?:"<>|]', "_", filename)
     ffmpeg_cmd = find_ffmpeg_cmd()
@@ -2082,7 +2213,7 @@ def download_youtube_audio_sync(url: str, filename: str) -> str | None:
     tried_proxies: set[str | None] = set()
     
     for proxy_attempt_num in range(max_proxy_attempts):
-        proxy = get_current_proxy()
+        proxy = get_current_proxy(preferred_proxy)
         if proxy in tried_proxies:
             logging.debug(f"[Audio] Proxy takrorlanayapti, tugating: {proxy[:40] if proxy else 'NONE'}")
             break
@@ -2198,19 +2329,24 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
     Proxy: YOUTUBE_PROXY dan ishlatiladi (.env ichida)
     """
     video_id = extract_youtube_video_id(url)
+    best_fast_proxy: str | None = None
+    if video_id:
+        best_fast_proxy = await get_fast_proxy_for_youtube(url, max_proxies=80, max_concurrency=16, timeout_seconds=4)
+        if best_fast_proxy:
+            logging.info(f"[Audio] Fast proxy tanlandi: {best_fast_proxy[:60]}...")
 
     # ========== 1. PIPED API (ASOSIY) ==========
     if video_id:
         try:
             logging.info("[Audio] Stage 1: Piped API (proxy bilan)...")
             audio_url, metadata = await asyncio.wait_for(
-                get_piped_audio_url(video_id),
+                get_piped_audio_url(video_id, proxy_override=best_fast_proxy),
                 timeout=15.0
             )
             if audio_url:
                 safe_filename = filename or (metadata.get("title", video_id) if metadata else video_id)
                 logging.info(f"[Audio] → Piped URL topildi, yuklash...")
-                audio_path = await download_piped_audio(audio_url, safe_filename)
+                audio_path = await download_piped_audio(audio_url, safe_filename, proxy_override=best_fast_proxy)
 
                 if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 2048:
                     logging.info(f"[Audio] ✓ MUVAFFAQIYATLI: Piped → {os.path.basename(audio_path)}")
@@ -2232,13 +2368,13 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
         try:
             logging.info("[Audio] Stage 2: Invidious API (YouTube zerkali)...")
             audio_url, metadata = await asyncio.wait_for(
-                get_invidious_audio_url(video_id),
+                get_invidious_audio_url(video_id, proxy_override=best_fast_proxy),
                 timeout=15.0
             )
             if audio_url:
                 safe_filename = filename or (metadata.get("title", video_id) if metadata else video_id)
                 logging.info(f"[Audio] → Invidious URL topildi, yuklash...")
-                audio_path = await download_invidious_audio(audio_url, safe_filename)
+                audio_path = await download_invidious_audio(audio_url, safe_filename, proxy_override=best_fast_proxy)
                 if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 2048:
                     logging.info("[Audio] ✓ MUVAFFAQIYATLI: Invidious")
                     return audio_path
@@ -2253,7 +2389,7 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
 
     # ========== 3. YT-DLP COOKIE-FREE CLIENTS (PROXY BILAN) ==========
     logging.warning(f"[Audio] Stage 3: yt-dlp cookie-free (7 clients, proxy bilan)...")
-    audio_path = await asyncio.to_thread(download_youtube_audio_sync, url, filename)
+    audio_path = await asyncio.to_thread(download_youtube_audio_sync, url, filename, best_fast_proxy)
     if audio_path:
         logging.info(f"[Audio] ✓ MUVAFFAQIYATLI: yt-dlp cookie-free")
         return audio_path
@@ -2274,7 +2410,8 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
                     url,
                     filename,
                     fresh_cookie,
-                    retry=False
+                    retry=False,
+                    preferred_proxy=best_fast_proxy
                 )
                 if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 2048:
                     logging.info(f"[Audio] ✓ MUVAFFAQIYATLI: Fresh cookies attempt {attempt}")
@@ -2300,7 +2437,8 @@ async def download_youtube_audio(url: str, filename: str) -> str | None:
                 url,
                 filename,
                 cookie_file,
-                retry=False
+                retry=False,
+                preferred_proxy=best_fast_proxy
             )
             if cookie_path and os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 2048:
                 logging.info("[Audio] ✓ MUVAFFAQIYATLI: Saved cookies")
@@ -2510,7 +2648,7 @@ def _should_refresh_cookies_on_error(error_type: str) -> bool:
 
 
 
-def _download_youtube_audio_with_cookies(url: str, filename: str, cookiefile: str, retry: bool = True) -> str | None:
+def _download_youtube_audio_with_cookies(url: str, filename: str, cookiefile: str, retry: bool = True, preferred_proxy: str | None = None) -> str | None:
     safe = re.sub(r'[\\/*?:"<>|]', "_", filename)
     ffmpeg_cmd = find_ffmpeg_cmd()
     output_path = os.path.join(tempfile.gettempdir(), f"dl_ck_{safe}.%(ext)s")
@@ -2538,7 +2676,7 @@ def _download_youtube_audio_with_cookies(url: str, filename: str, cookiefile: st
     }
     if ffmpeg_cmd:
         opts["ffmpeg_location"] = os.path.dirname(ffmpeg_cmd)
-    proxy = get_current_proxy()
+    proxy = get_current_proxy(preferred_proxy)
     if proxy:
         opts["proxy"] = proxy
 
@@ -2579,7 +2717,7 @@ def _download_youtube_audio_with_cookies(url: str, filename: str, cookiefile: st
                     mark_operation_blocked(cookiefile)
                     if AUTO_REFRESH_COOKIES and retry and refresh_youtube_cookiefile():
                         logging.info("[Audio] Cookie fayl yangilandi, qayta urinish...")
-                        return _download_youtube_audio_with_cookies(url, filename, cookiefile, retry=False)
+                        return _download_youtube_audio_with_cookies(url, filename, cookiefile, retry=False, preferred_proxy=preferred_proxy)
                     return None
 
                 if os.path.getsize(check_path) > 1024:
@@ -2609,7 +2747,7 @@ def _download_youtube_audio_with_cookies(url: str, filename: str, cookiefile: st
                 logging.info("[Audio] Cookies qayta yangilash urinish...")
                 if refresh_youtube_cookiefile():
                     logging.info("[Audio] Cookie fayl yangilandi, qayta urinish...")
-                    return _download_youtube_audio_with_cookies(url, filename, cookiefile, retry=False)
+                    return _download_youtube_audio_with_cookies(url, filename, cookiefile, retry=False, preferred_proxy=preferred_proxy)
         elif "403" in err:
             logging.warning("[Audio] Cookie fallback: 403 Forbidden")
         elif "Sign in" in err or "login" in err.lower():
@@ -6435,7 +6573,7 @@ async def main():
         print("[CRITICAL]      PROXY_LIST=socks5://host:port\n...\n")
         print("[CRITICAL]      PROXY_LIST_FILE=/app/proxies.txt")
     if PROXY_LIST_ENABLED and PROXY_LIST_URLS:
-        print("[CRITICAL]   ➜ GitHub proxy ro'yxati ham ishlaydi: PROXY_LIST_URLS")
+        print("[CRITICAL]   ➜ Remote proxy manbalaridan avtomatik proxy yuklanadi: PROXY_LIST_URLS")
         print(f"[CRITICAL]      {PROXY_LIST_URLS[0]}")
     if PROXY_LIST:
         print("[CRITICAL]   ➜ Local PROXY_LIST env ichidagi proxylar ham ishlaydi")
@@ -6479,6 +6617,9 @@ async def main():
 
     if AUTO_REFRESH_COOKIES:
         _schedule_auto_cookie_refresh()
+
+    if PROXY_MONITOR_ENABLED:
+        _schedule_proxy_monitoring()
 
     try:
         print("[INFO] Polling boshlanyapti...")
