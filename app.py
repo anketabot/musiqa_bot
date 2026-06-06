@@ -263,6 +263,17 @@ PROXY_LIST_URLS = [
         "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all&ssl=all&anonymity=all,https://www.proxy-list.download/api/v1/get?type=http&anon=all"
     ).split(",") if url.strip()
 ]
+# Remove old GitHub proxy source if it is present, because it is unreliable and often blocked.
+PROXY_LIST_URLS = [
+    url for url in PROXY_LIST_URLS
+    if "raw.githubusercontent.com/proxifly/free-proxy-list" not in url
+]
+if not PROXY_LIST_URLS:
+    PROXY_LIST_URLS = [
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all&ssl=all&anonymity=all",
+        "https://www.proxy-list.download/api/v1/get?type=http&anon=all",
+    ]
+    logging.warning("[Proxy] GitHub manbasi PRIMARY proxy listdan olib tashlandi, standart proxy manbalari ishlatilmoqda.")
 PROXY_LIST = os.getenv("PROXY_LIST", "").strip()
 PROXY_LIST_FILE = os.getenv("PROXY_LIST_FILE", "").strip()
 PROXY_LIST_REFRESH_INTERVAL_MINUTES = int(os.getenv("PROXY_LIST_REFRESH_INTERVAL_MINUTES", "60"))
