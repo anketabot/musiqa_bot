@@ -461,7 +461,7 @@ class ProxyRotationManager:
         return candidates
 
     def block_proxy(self, proxy: str) -> None:
-        if proxy:
+        if proxy and proxy not in self.blocked:
             self.blocked.add(proxy)
             logging.warning(f"[ProxyList] Blocked proxy: {proxy}")
 
@@ -472,6 +472,7 @@ class ProxyRotationManager:
             "probes": 0,
             "successes": 0,
             "failures": 0,
+            "consecutive_failures": 0,
             "latency_sum": 0.0,
             "last_success": 0.0,
             "last_failure": 0.0,
@@ -480,11 +481,13 @@ class ProxyRotationManager:
         if success:
             stats["successes"] += 1
             stats["last_success"] = time.time()
+            stats["consecutive_failures"] = 0
             if latency is not None:
                 stats["latency_sum"] += latency
         else:
             stats["failures"] += 1
             stats["last_failure"] = time.time()
+            stats["consecutive_failures"] += 1
 
     def get_best_proxy(self) -> str | None:
         if not self.proxies:
@@ -537,10 +540,12 @@ class ProxyRotationManager:
                             self.block_proxy(proxy)
                         else:
                             self.record_proxy_result(proxy, False, elapsed)
+                        if self.proxy_stats.get(proxy, {}).get("consecutive_failures", 0) >= 2:
+                            self.block_proxy(proxy)
                 except Exception as e:
                     self.record_proxy_result(proxy, False, None)
-                    self.block_proxy(proxy)
-                    logging.debug(f"[ProxyMonitor] {proxy[:40]} failed: {e}")
+                    if self.proxy_stats.get(proxy, {}).get("consecutive_failures", 0) >= 2:
+                        self.block_proxy(proxy)
 
         async with aiohttp.ClientSession(connector=connector) as session:
             tasks = [asyncio.create_task(probe(proxy, session)) for proxy in proxies]
@@ -618,9 +623,15 @@ async def get_fast_proxy_for_youtube(url: str, max_proxies: int = 20, max_concur
                     if response.status in (403, 429):
                         logging.warning(f"[Proxy] Fast probe blocked: {proxy[:40]}... status={response.status}")
                         proxy_list_manager.block_proxy(proxy)
+                        return None
+                    proxy_list_manager.record_proxy_result(proxy, False, elapsed)
+                    if proxy_list_manager.proxy_stats.get(proxy, {}).get("consecutive_failures", 0) >= 2:
+                        proxy_list_manager.block_proxy(proxy)
             except Exception as e:
                 logging.debug(f"[Proxy] Fast probe failed for {proxy[:40]}...: {e}")
-                proxy_list_manager.block_proxy(proxy)
+                proxy_list_manager.record_proxy_result(proxy, False, None)
+                if proxy_list_manager.proxy_stats.get(proxy, {}).get("consecutive_failures", 0) >= 2:
+                    proxy_list_manager.block_proxy(proxy)
             return None
 
     async with aiohttp.ClientSession(connector=connector) as session:
