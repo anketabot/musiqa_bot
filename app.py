@@ -249,12 +249,6 @@ def _resolve_youtube_proxy(raw: str, api_key: str, api_format: str) -> str:
     return ""
 
 
-YOUTUBE_PROXY = _resolve_youtube_proxy(YOUTUBE_PROXY_RAW, PROXY_API_KEY, PROXY_API_FORMAT)
-if YOUTUBE_PROXY:
-    logging.info(f"[Proxy] YOUTUBE_PROXY o'rnatildi: {YOUTUBE_PROXY[:60]}")
-else:
-    logging.warning("[Proxy] YOUTUBE_PROXY aniqlanmadi yoki noto'g'ri format; proxy ishlatilmaydi.")
-
 # Proxy list sources for dynamic rotation
 PROXY_LIST_ENABLED = os.getenv("PROXY_LIST_ENABLED", "1").lower() in ("1", "true", "yes")
 PROXY_LIST_URLS = [
@@ -282,6 +276,14 @@ PROXY_MONITOR_ENABLED = os.getenv("PROXY_MONITOR_ENABLED", "1").lower() in ("1",
 PROXY_MONITOR_INTERVAL_MINUTES = int(os.getenv("PROXY_MONITOR_INTERVAL_MINUTES", "15"))
 PROXY_MONITOR_SAMPLE_COUNT = int(os.getenv("PROXY_MONITOR_SAMPLE_COUNT", "10"))
 PROXY_MONITOR_TIMEOUT_SECONDS = int(os.getenv("PROXY_MONITOR_TIMEOUT_SECONDS", "5"))
+
+YOUTUBE_PROXY = _resolve_youtube_proxy(YOUTUBE_PROXY_RAW, PROXY_API_KEY, PROXY_API_FORMAT)
+if YOUTUBE_PROXY:
+    logging.info(f"[Proxy] YOUTUBE_PROXY o'rnatildi: {YOUTUBE_PROXY[:60]}")
+elif PROXY_LIST_ENABLED and PROXY_LIST_URLS:
+    logging.info("[Proxy] YOUTUBE_PROXY aniq emas; remote proxy manbalari avtomatik ravishda yuklanadi.")
+else:
+    logging.warning("[Proxy] YOUTUBE_PROXY aniqlanmadi yoki noto'g'ri format; proxy ishlatilmaydi.")
 
 
 def _normalize_proxy_url(value: str) -> str | None:
@@ -6570,46 +6572,68 @@ async def main():
     print(f"[OK]   → Cookies pool directory: {cookie_rotation_manager.pool_dir}")
     print("[OK] 🎵 YouTube audio yuklash: Fresh cookies + Multi-attempt strategyasi bilan")
     print("")
-    print("[CRITICAL] ⚠️  MUHIM: PROXY O'RNATISH KERAK!")
-    print("[CRITICAL] YouTube regulyar ravishda bot-block qiladi. PROXY ishlatish ZARURIY:")
-    print("[CRITICAL]")
-    print("[CRITICAL] Download Pipeline (v7 - OPTIMIZED):")
-    print("[CRITICAL]   1️⃣ Piped API (proxy-free, eng tez)")
-    print("[CRITICAL]   2️⃣ Invidious API (YouTube zerkali, proxy-free)")
-    print("[CRITICAL]   3️⃣ yt-dlp Cookie-Free (7 clients, proxy bilan)")
-    print("[CRITICAL]   4️⃣ Fresh Cookies x3 (proxy rotation, container-optimized)")
-    print("[CRITICAL]   5️⃣ Saved Cookies (last resort, proxy bilan)")
-    print("[CRITICAL]")
-    print("[CRITICAL] 🔧 SETUP:")
-    if YOUTUBE_PROXY:
-        print("[CRITICAL]   1. .env ga YOUTUBE_PROXY qo'shish yoki to'g'ri sozlash:")
-        print(f"[CRITICAL]      YOUTUBE_PROXY={YOUTUBE_PROXY}")
-    elif PROXY_API_KEY and PROXY_API_FORMAT:
-        print("[CRITICAL]   1. .env ga PROXY_API_KEY va PROXY_API_FORMAT qo'shish:")
-        print("[CRITICAL]      PROXY_API_KEY=YOUR_API_KEY")
-        print("[CRITICAL]      PROXY_API_FORMAT=http://{api_key}@proxy.provider.com:8000")
-    elif PROXY_API_KEY:
-        print("[CRITICAL]   1. .env ga PROXY_API_KEY va PROXY_API_FORMAT qo'shish:")
-        print("[CRITICAL]      PROXY_API_KEY=YOUR_API_KEY")
-        print("[CRITICAL]      PROXY_API_FORMAT=http://{api_key}@proxy.provider.com:8000")
+    proxy_sources_available = bool(
+        YOUTUBE_PROXY
+        or PROXY_LIST
+        or PROXY_LIST_FILE
+        or (PROXY_LIST_ENABLED and PROXY_LIST_URLS)
+    )
+
+    if proxy_sources_available:
+        print("[INFO] PROXY manbalari mavjud. Agar YOUTUBE_PROXY yo'q bo'lsa, remote proxy list manbalari avtomatik ishlatiladi.")
+        if YOUTUBE_PROXY:
+            print(f"[INFO]   YOUTUBE_PROXY mavjud: {YOUTUBE_PROXY[:60]}")
+        else:
+            if PROXY_LIST_ENABLED and PROXY_LIST_URLS:
+                print("[INFO]   Remote proxy list manbalari avtomatik yuklanadi: PROXY_LIST_URLS")
+                print(f"[INFO]      {PROXY_LIST_URLS[0]}")
+            if PROXY_LIST:
+                print("[INFO]   Local PROXY_LIST env ichidagi proxylar ham ishlaydi")
+            if PROXY_LIST_FILE:
+                print(f"[INFO]   Local proxy fayl ishlaydi: {PROXY_LIST_FILE}")
+        print("[INFO]   Logs'da 'Proxy qo'llanilmoqda' xabarini ko'rish")
+        print("")
     else:
-        print("[CRITICAL]   1. .env ga YOUTUBE_PROXY qo'shish yoki local/proxy list faylini sozlash:")
-        print("[CRITICAL]      YOUTUBE_PROXY=http://proxy-ip:port")
-        print("[CRITICAL]   2. Yoki PROXY_LIST / PROXY_LIST_FILE orqali lokal proxy ro'yxatini kiriting")
-        print("[CRITICAL]      PROXY_LIST=socks5://host:port\n...\n")
-        print("[CRITICAL]      PROXY_LIST_FILE=/app/proxies.txt")
-    if PROXY_LIST_ENABLED and PROXY_LIST_URLS:
-        print("[CRITICAL]   ➜ Remote proxy manbalaridan avtomatik proxy yuklanadi: PROXY_LIST_URLS")
-        print(f"[CRITICAL]      {PROXY_LIST_URLS[0]}")
-    if PROXY_LIST:
-        print("[CRITICAL]   ➜ Local PROXY_LIST env ichidagi proxylar ham ishlaydi")
-    if PROXY_LIST_FILE:
-        print(f"[CRITICAL]   ➜ Local proxy fayl ishlaydi: {PROXY_LIST_FILE}")
-    print("[CRITICAL]   2. Bot qayta ishga tushirish")
-    print("[CRITICAL]   3. Logs'da 'Proxy qo'llanilmoqda' xabarini ko'rish")
-    print("[CRITICAL]")
-    print("[CRITICAL] 📖 Setup guide: PROXY_SETUP_GUIDE.md ko'ring")
-    print("")
+        print("[CRITICAL] ⚠️  MUHIM: PROXY O'RNATISH KERAK!")
+        print("[CRITICAL] YouTube regulyar ravishda bot-block qiladi. PROXY ishlatish ZARURIY:")
+        print("[CRITICAL]")
+        print("[CRITICAL] Download Pipeline (v7 - OPTIMIZED):")
+        print("[CRITICAL]   1️⃣ Piped API (proxy-free, eng tez)")
+        print("[CRITICAL]   2️⃣ Invidious API (YouTube zerkali, proxy-free)")
+        print("[CRITICAL]   3️⃣ yt-dlp Cookie-Free (7 clients, proxy bilan)")
+        print("[CRITICAL]   4️⃣ Fresh Cookies x3 (proxy rotation, container-optimized)")
+        print("[CRITICAL]   5️⃣ Saved Cookies (last resort, proxy bilan)")
+        print("[CRITICAL]")
+        print("[CRITICAL] 🔧 SETUP:")
+        if YOUTUBE_PROXY:
+            print("[CRITICAL]   1. .env ga YOUTUBE_PROXY qo'shish yoki to'g'ri sozlash:")
+            print(f"[CRITICAL]      YOUTUBE_PROXY={YOUTUBE_PROXY}")
+        elif PROXY_API_KEY and PROXY_API_FORMAT:
+            print("[CRITICAL]   1. .env ga PROXY_API_KEY va PROXY_API_FORMAT qo'shish:")
+            print("[CRITICAL]      PROXY_API_KEY=YOUR_API_KEY")
+            print("[CRITICAL]      PROXY_API_FORMAT=http://{api_key}@proxy.provider.com:8000")
+        elif PROXY_API_KEY:
+            print("[CRITICAL]   1. .env ga PROXY_API_KEY va PROXY_API_FORMAT qo'shish:")
+            print("[CRITICAL]      PROXY_API_KEY=YOUR_API_KEY")
+            print("[CRITICAL]      PROXY_API_FORMAT=http://{api_key}@proxy.provider.com:8000")
+        else:
+            print("[CRITICAL]   1. .env ga YOUTUBE_PROXY qo'shish yoki local/proxy list faylini sozlash:")
+            print("[CRITICAL]      YOUTUBE_PROXY=http://proxy-ip:port")
+            print("[CRITICAL]   2. Yoki PROXY_LIST / PROXY_LIST_FILE orqali lokal proxy ro'yxatini kiriting")
+            print("[CRITICAL]      PROXY_LIST=socks5://host:port\n...\n")
+            print("[CRITICAL]      PROXY_LIST_FILE=/app/proxies.txt")
+        if PROXY_LIST_ENABLED and PROXY_LIST_URLS:
+            print("[CRITICAL]   ➜ Remote proxy manbalaridan avtomatik proxy yuklanadi: PROXY_LIST_URLS")
+            print(f"[CRITICAL]      {PROXY_LIST_URLS[0]}")
+        if PROXY_LIST:
+            print("[CRITICAL]   ➜ Local PROXY_LIST env ichidagi proxylar ham ishlaydi")
+        if PROXY_LIST_FILE:
+            print(f"[CRITICAL]   ➜ Local proxy fayl ishlaydi: {PROXY_LIST_FILE}")
+        print("[CRITICAL]   2. Bot qayta ishga tushirish")
+        print("[CRITICAL]   3. Logs'da 'Proxy qo'llanilmoqda' xabarini ko'rish")
+        print("[CRITICAL]")
+        print("[CRITICAL] 📖 Setup guide: PROXY_SETUP_GUIDE.md ko'ring")
+        print("")
 
     if shazam_client is None:
         print("[WARN] ShazamIO o'rnatilmagan. Ovozli xabar aniqlash ishlamaydi.")
