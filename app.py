@@ -664,15 +664,25 @@ async def get_fast_proxy_for_youtube(url: str, max_proxies: int = 20, max_concur
     return get_current_proxy()
 
 
-def mark_proxy_blocked(proxy: str | None) -> None:
+def mark_proxy_blocked(proxy: str | None, force: bool = False) -> None:
     if not proxy:
         return
     if proxy == YOUTUBE_PROXY:
         proxy_list_manager.blocked.add(proxy)
         logging.warning(f"[Proxy] YOUTUBE_PROXY bloklandi: {proxy}")
         return
-    proxy_list_manager.block_proxy(proxy)
-    logging.debug(f"[Proxy] Fallback proxy bloklandi: {proxy}")
+    if force:
+        proxy_list_manager.block_proxy(proxy)
+        logging.warning(f"[Proxy] Fallback proxy majburiy bloklandi: {proxy}")
+        return
+
+    proxy_list_manager.record_proxy_result(proxy, False, None)
+    consecutive = proxy_list_manager.proxy_stats.get(proxy, {}).get("consecutive_failures", 0)
+    if consecutive >= 2:
+        proxy_list_manager.block_proxy(proxy)
+        logging.warning(f"[Proxy] Fallback proxy bloklandi ({consecutive} ketma-ket muvaffaqiyatsizlik): {proxy}")
+    else:
+        logging.debug(f"[Proxy] Fallback proxy muvaffaqiyatsiz ({consecutive}/2): {proxy}")
 
 # YouTube cookies fayli uchun maxsus yo‘l (agar qo‘lda eksport qilingan bo‘lsa)
 YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIE_FILE", "")
@@ -2322,9 +2332,14 @@ def download_youtube_audio_sync(url: str, filename: str, preferred_proxy: str | 
                 if proxy and any(token in err for token in (
                     "proxy", "timed out", "connection refused", "cannot connect", "failed to connect",
                     "connection reset", "remote host", "proxy error"
-                )) or proxy and error_type in ("BOT_BLOCKED", "FORBIDDEN", "RATE_LIMIT", "BLOCKED", "UNAVAILABLE"):
+                )):
                     logging.warning(f"[Audio] yt-dlp proxy {proxy[:40]} ishlamadi: {error_type or err[:40]}. Next proxy... ")
-                    mark_proxy_blocked(proxy)
+                    mark_proxy_blocked(proxy, force=False)
+                    break
+
+                if proxy and error_type in ("BOT_BLOCKED", "FORBIDDEN", "RATE_LIMIT", "BLOCKED", "UNAVAILABLE"):
+                    logging.warning(f"[Audio] yt-dlp proxy {proxy[:40]} bloklandi (YouTube block): {error_type}. Next proxy...")
+                    mark_proxy_blocked(proxy, force=True)
                     break
 
                 if error_type in ("LOGIN_REQUIRED", "BOT_BLOCKED", "FORBIDDEN"):
